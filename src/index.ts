@@ -72,6 +72,8 @@ const providerFor = (origin: string): OAuthProvider<Env> => {
     clientIdMetadataDocumentEnabled: true,
     scopesSupported: SCOPES,
     requiredScopes: ["notes"],
+    // A new grant lasts refreshTokenTTL; each refresh then extends it by refreshTokenIdleTTL.
+    refreshTokenTTL: GRANT_IDLE_DAYS * 24 * 60 * 60,
     refreshTokenIdleTTL: GRANT_IDLE_DAYS * 24 * 60 * 60,
     resourceMetadata: { resource, authorization_servers: [origin], resource_name: "fridge-notes" },
     // AUTH_TOKENS keep working next to OAuth, for clients that can only send a fixed header.
