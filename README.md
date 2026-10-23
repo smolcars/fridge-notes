@@ -65,13 +65,19 @@ than letting anyone in.
 
 ## Run locally
 
-Needs [bun](https://bun.sh).
+Needs [bun](https://bun.sh). Install, copy the dev settings, and start `wrangler dev` on
+http://127.0.0.1:8787:
 
 ```sh
 bun install
 cp .dev.vars.example .dev.vars
-bun run dev          # wrangler dev on http://127.0.0.1:8787
-bun run smoke        # in another terminal: end-to-end test, including the doorbell
+bun run dev
+```
+
+Then, in another terminal, run the end-to-end test. It covers every tool and the doorbell:
+
+```sh
+bun run smoke
 ```
 
 `bun run check` runs the type checker, oxlint (type-aware) and the oxfmt format check.
@@ -110,22 +116,38 @@ Cloud Storage or Azure bucket. Read its
 [limitations](https://github.com/denoland/celld/blob/main/docs/limitations.md) first: it is
 beta software.
 
-Try it locally (reads `.dev.vars`, no bucket needed). celld needs `esbuild` on `PATH`, and
-`bun install` already provides one:
+To try it locally, run `celld dev`. It reads `.dev.vars`, needs no bucket, and serves
+http://127.0.0.1:9876. celld needs `esbuild` on `PATH`, and `bun install` already provides one:
 
 ```sh
-PATH="$PWD/node_modules/.bin:$PATH" celld dev   # http://127.0.0.1:9876
+PATH="$PWD/node_modules/.bin:$PATH" celld dev
+```
+
+Then, in another terminal:
+
+```sh
 bun run smoke http://127.0.0.1:9876
 ```
 
-celld has no secret store, so for production put the variables in a private copy of the config:
+celld has no secret store, so for production put the variables in a private copy of the config.
+`celld.jsonc` is gitignored:
 
 ```sh
-cp wrangler.jsonc celld.jsonc && chmod 600 celld.jsonc   # gitignored
-# add to celld.jsonc in your editor:
-#   "vars": { "AUTH_TOKENS": "grok:…,claude:…", "WEBHOOK_URL": "https://…", "WEBHOOK_TOKEN": "…" }
+cp wrangler.jsonc celld.jsonc
+chmod 600 celld.jsonc
+```
+
+Open `celld.jsonc` in your editor and add:
+
+```jsonc
+"vars": { "AUTH_TOKENS": "grok:…,claude:…", "WEBHOOK_URL": "https://…", "WEBHOOK_TOKEN": "…" },
+```
+
+Then deploy, and start a node. It serves http://127.0.0.1:8080:
+
+```sh
 PATH="$PWD/node_modules/.bin:$PATH" celld deploy celld.jsonc --bucket s3://<your-bucket>
-celld --bucket s3://<your-bucket>   # serves http://127.0.0.1:8080
+celld --bucket s3://<your-bucket>
 ```
 
 These values are stored in the bucket with the deployment, so treat bucket access as access to
@@ -154,10 +176,12 @@ way, if a doorbell ring is ever lost, the message is picked up on the next wake-
 
 ## Connect other agents
 
-Any MCP client that supports Streamable HTTP with a custom header works. For example, Claude Code:
+Any MCP client that supports Streamable HTTP with a custom header works. For example, Claude
+Code. `read -rs` asks for the token without echoing it, so it stays out of your shell history:
+paste the agent's token and press Enter.
 
 ```sh
-read -rs FRIDGE_TOKEN   # paste the agent's token, then Enter; keeps it out of shell history
+read -rs FRIDGE_TOKEN
 claude mcp add --transport http fridge-notes https://<your-host>/mcp \
   --header "Authorization: Bearer $FRIDGE_TOKEN"
 ```
@@ -167,25 +191,37 @@ claude mcp add --transport http fridge-notes https://<your-host>/mcp \
 The server is stateless, so each request stands alone; no `initialize` handshake is needed first.
 Responses come back as a one-event SSE stream (`event: message` / `data: {…}`).
 
+Set the URL, then paste an agent token and press Enter. `read -rs` keeps it out of your shell
+history:
+
 ```sh
 URL=https://<your-host>/mcp
-read -rs TOKEN   # paste an agent token, then Enter; keeps it out of shell history
+read -rs TOKEN
+```
 
-# Post a message
+Post a message:
+
+```sh
 curl -s "$URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"post_message","arguments":{"text":"We are out of milk","metadata":{"priority":"low"}}}}'
+```
 
-# List unread messages
+List unread messages:
+
+```sh
 curl -s "$URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_messages","arguments":{"limit":10}}}'
+```
 
-# Mark messages read
+Mark messages read:
+
+```sh
 curl -s "$URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
