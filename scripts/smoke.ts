@@ -4,6 +4,8 @@
 //
 //   bun scripts/smoke.ts [base-url]   (default http://127.0.0.1:8787)
 //
+// One run posts close to the 30-notes-per-minute limit, so leave a minute between runs.
+//
 // Env overrides: AGENT_TOKEN, GROK_TOKEN, OWNER_PASSWORD, WEBHOOK_TOKEN, WEBHOOK_PORT.
 import * as z from "zod";
 
@@ -141,6 +143,10 @@ const receiver = Bun.serve({
       body: Ring.parse(await request.json()),
     });
     onRing();
+    // A webhook that redirects elsewhere: the server must not follow it to /bounced.
+    if (new URL(request.url).pathname === "/bounce") {
+      return Response.redirect(`http://127.0.0.1:${webhookPort}/bounced`, 307);
+    }
     return new Response("ok");
   },
 });
@@ -414,8 +420,8 @@ try {
       consent.response.status,
     );
     check(
-      "approval page lists the existing agents",
-      consent.html.includes("Existing agents") && consent.html.includes("<strong>grok</strong>"),
+      "approval page reveals no existing agents or doorbells",
+      !/\bgrok\b/.test(consent.html) && !consent.html.includes(`:${webhookPort}`),
       consent.html.length,
     );
 
@@ -439,11 +445,37 @@ try {
       badWebhook.status,
     );
 
+    // A taken name is revealed only to the owner, and taking it over must be deliberate.
+    const takenPage = await openConsent();
+    const takenWrong = await submitConsent(takenPage, {
+      agent: "agent",
+      password: "not-the-password",
+      decision: "approve",
+    });
+    const takenWrongHtml = await takenWrong.text();
+    check(
+      "a taken name isn't revealed before the password",
+      takenWrong.status === 400 &&
+        takenWrongHtml.includes("Wrong password") &&
+        !takenWrongHtml.includes("already an agent"),
+      takenWrong.status,
+    );
+    const taken = await submitConsent(
+      { html: takenWrongHtml, cookie: cookiesFrom(takenWrong) },
+      { agent: "agent", password: ownerPassword, decision: "approve" },
+    );
+    check(
+      "reusing a name needs the reconnecting box",
+      taken.status === 400 && (await taken.text()).includes("already an agent named"),
+      taken.status,
+    );
+
     const wrongPassword = await submitConsent(badWebhookPage, {
       agent: "smoke-oauth",
       password: "not-the-password",
       webhook_url: oauthBell,
       webhook_key: "oauth-bell-key",
+      reuse: "1",
       decision: "approve",
     });
     const retryPage = { html: await wrongPassword.text(), cookie: cookiesFrom(wrongPassword) };
@@ -462,6 +494,7 @@ try {
       password: ownerPassword,
       webhook_url: oauthBell,
       webhook_key: "oauth-bell-key",
+      reuse: "1",
       decision: "approve",
     });
     const callback = new URL(approved.headers.get("location") ?? "about:blank");
@@ -530,17 +563,20 @@ try {
       rings.at(-1),
     );
 
-    /** Approves the same app again with `fields`. This replaces its approval, and the tokens above. */
-    const reapprove = async (fields: Record<string, string>): Promise<number> => {
-      const page = await openConsent();
-      const response = await submitConsent(page, {
-        agent: "smoke-oauth",
+    /**
+     * Approves the same app again as `agent` with `fields`, reconnecting an existing name. This
+     * replaces the app's approval, and with it the tokens above.
+     */
+    const approveAs = async (agent: string, fields: Record<string, string>): Promise<Response> =>
+      submitConsent(await openConsent(), {
+        agent,
         password: ownerPassword,
+        reuse: "1",
         decision: "approve",
         ...fields,
       });
-      return response.status;
-    };
+    const reapprove = async (fields: Record<string, string>): Promise<number> =>
+      (await approveAs("smoke-oauth", fields)).status;
     const keptStatus = await reapprove({});
     check(
       "approving again without a webhook keeps the doorbell",
@@ -553,6 +589,91 @@ try {
       removedStatus === 302 && !(await ringsSmokeOauth()),
       removedStatus,
     );
+
+    const bounceStatus = await reapprove({ webhook_url: `http://127.0.0.1:${webhookPort}/bounce` });
+    await ringsSmokeOauth();
+    await Bun.sleep(500);
+    check(
+      "a webhook's redirect isn't followed",
+      bounceStatus === 302 &&
+        rings.at(-1)?.path === "/bounce" &&
+        !rings.some((r) => r.path === "/bounced"),
+      rings.slice(-2),
+    );
+
+    // Removing an agent's doorbell also stops the WEBHOOK_* doorbell for it (grok, here).
+    const settingsWebhook = `http://127.0.0.1:${webhookPort}/webhook`;
+    const ringsGrok = async (): Promise<boolean> => {
+      const rung = nextRing(2_000);
+      await tool(Message, agentToken, "post_message", { to: "grok", text: "ping" });
+      return (await rung) && rings.at(-1)?.path === "/webhook";
+    };
+    const grokOff = await approveAs("grok", { webhook_remove: "1" });
+    check(
+      "removing a doorbell also silences the settings doorbell",
+      grokOff.status === 302 && !(await ringsGrok()),
+      grokOff.status,
+    );
+    const grokOn = await approveAs("grok", {
+      webhook_url: settingsWebhook,
+      webhook_key: webhookToken,
+    });
+    check(
+      "setting it again on the approval page rings again",
+      grokOn.status === 302 && (await ringsGrok()),
+      grokOn.status,
+    );
+
+    // Two agents with doorbells answering each other: after the exchange limit, notes still
+    // arrive but stop ringing.
+    const loopName = `loop-${crypto.randomUUID().slice(0, 8)}`;
+    const loopApproval = await approveAs(loopName, {
+      reuse: "",
+      webhook_url: `http://127.0.0.1:${webhookPort}/loop-bell`,
+    });
+    const loopCode =
+      new URL(loopApproval.headers.get("location") ?? "about:blank").searchParams.get("code") ?? "";
+    const loopTokens = Tokens.parse(
+      await (
+        await fetch(endpoints.token_endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: loopCode,
+            redirect_uri: redirectUri,
+            client_id: clientId,
+            code_verifier: verifier,
+            resource: resource.resource,
+          }),
+        })
+      ).json(),
+    );
+    const exchangeIds: number[] = [];
+    for (let turn = 0; turn < 12; turn++) {
+      const [token, to] =
+        turn % 2 === 0 ? [grokToken, loopName] : [loopTokens.access_token, "grok"];
+      // Sequential on purpose: each note answers the previous one.
+      // oxlint-disable-next-line no-await-in-loop
+      const note = await tool(Message, token, "post_message", { to, text: `turn ${turn}` });
+      exchangeIds.push(note.id);
+    }
+    await Bun.sleep(1_000);
+    const exchangeRings = rings.filter((r) => exchangeIds.includes(r.body.message_id)).length;
+    check("a back-and-forth stops ringing after 10 exchanges", exchangeRings === 10, exchangeRings);
+    const loopInbox = await tool(z.array(Message), loopTokens.access_token, "list_messages", {});
+    check("…but its notes still arrive", loopInbox.length === 6, loopInbox.length);
+
+    // One-way notes never count toward it.
+    const oneWayIds = await Promise.all(
+      Array.from({ length: 11 }, async (_, i) => {
+        const note = await tool(Message, agentToken, "post_message", { to: "grok", text: `${i}` });
+        return note.id;
+      }),
+    );
+    await Bun.sleep(1_000);
+    const oneWayRings = rings.filter((r) => oneWayIds.includes(r.body.message_id)).length;
+    check("one-way notes always ring", oneWayRings === 11, oneWayRings);
 
     // 15 wrong passwords at once from one IP: exactly 10 may be checked, the rest are locked out.
     const burstIp = randomIp();
