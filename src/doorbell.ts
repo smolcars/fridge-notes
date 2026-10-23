@@ -54,6 +54,9 @@ export const ringDoorbell = async (doorbell: Doorbell, message: Message): Promis
         to: message.to,
       }),
       signal: AbortSignal.timeout(10_000),
+      // A redirect could send the note to a host the owner never approved, so it counts as a
+      // failed ring instead of being followed.
+      redirect: "manual",
     });
     await response.body?.cancel();
     // Log only the status: the webhook URL and key are secrets.
