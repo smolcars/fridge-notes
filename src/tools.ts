@@ -99,8 +99,14 @@ export const createServer = ({ agent, board, onPost }: ServerContext): McpServer
           .describe("Only return messages with a larger id"),
         since: z.iso
           .datetime({ offset: true })
+          // Date keeps milliseconds only; finer digits would be dropped and widen the cutoff.
+          .refine((value) => !/\.\d{4}/.test(value), {
+            error: "since supports at most millisecond precision",
+          })
           .optional()
-          .describe("Only return messages created at or after this ISO 8601 timestamp"),
+          .describe(
+            "Only return messages created at or after this ISO 8601 timestamp (at most millisecond precision)",
+          ),
         limit: limitSchema(50),
       }),
       annotations: { readOnlyHint: true },

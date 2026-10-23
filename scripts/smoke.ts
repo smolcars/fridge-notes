@@ -204,6 +204,10 @@ try {
     metadata: { blob: "x".repeat(5_000) },
   });
   check("oversized metadata is rejected", bigMetadata.isError === true, bigMetadata);
+  const microseconds = await callTool(agentToken, "list_messages", {
+    since: "2026-01-01T00:00:00.000001Z",
+  });
+  check("sub-millisecond since is rejected", microseconds.isError === true, microseconds);
 } finally {
   await receiver.stop(true);
 }
