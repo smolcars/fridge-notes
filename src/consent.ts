@@ -6,6 +6,8 @@ import {
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
 import { AGENT_NAME, ownerPasswordConfigured, passwordMatches } from "./auth.ts";
+import type { Board, Doorbell } from "./board.ts";
+import { isLoopbackHost, parseDoorbell } from "./doorbell.ts";
 import type { Env } from "./index.ts";
 
 /** Everything this server can grant. `notes` is the only real permission: full board access. */
@@ -41,7 +43,10 @@ const page = (title: string, body: string): string => `<!doctype html>
   .error { background: #fde4e4; color: #8a1c1c; }
   label { display: block; margin: 1rem 0 0; font-weight: 600; font-size: 0.9rem; }
   label small { display: block; font-weight: 400; color: #5c5c58; }
-  input:not([type=hidden]) { box-sizing: border-box; width: 100%; margin-top: 0.3rem; padding: 0.55rem 0.7rem; font: inherit; border: 1px solid #c8c8c2; border-radius: 8px; }
+  input:not([type=hidden], [type=checkbox]) { box-sizing: border-box; width: 100%; margin-top: 0.3rem; padding: 0.55rem 0.7rem; font: inherit; border: 1px solid #c8c8c2; border-radius: 8px; }
+  label.check { display: flex; gap: 0.5rem; align-items: center; font-weight: 400; }
+  fieldset { border: 1px solid #e2e2dc; border-radius: 10px; margin: 1rem 0 0; padding: 0 0.9rem 0.9rem; }
+  legend { font-weight: 600; font-size: 0.9rem; padding: 0 0.3rem; }
   .actions { display: flex; gap: 0.75rem; margin-top: 1.5rem; }
   button { flex: 1; padding: 0.6rem; font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid #c8c8c2; background: #fff; cursor: pointer; }
   button.primary { background: #dc2626; border-color: #dc2626; color: #fff; }
@@ -73,11 +78,26 @@ const suggestAgentName = (clientName: string): string =>
     .replace(/^-+|-+$/g, "")
     .slice(0, 32) || "agent";
 
+type AgentSummary = Awaited<ReturnType<Board["agentSummaries"]>>[number];
+
 interface FormState {
   handle: string;
   agent: string;
+  /** Echoed back after a mistake so it needn't be retyped. The key never is. */
+  webhookUrl: string;
+  agents: AgentSummary[];
   error?: string | undefined;
 }
+
+const agentList = (agents: AgentSummary[]): string =>
+  agents.length === 0
+    ? ""
+    : `<small>Existing agents: ${agents
+        .map(
+          ({ name, doorbellHost }) =>
+            `<strong>${escape(name)}</strong>${doorbellHost === null ? "" : ` (wakes via ${escape(doorbellHost)})`}`,
+        )
+        .join(", ")}. Reusing a name gives this app that agent's notes.</small>`;
 
 const consentPage = (details: ConsentDescription, form: FormState): string => {
   const name = escape(details.clientName);
@@ -92,8 +112,9 @@ const consentPage = (details: ConsentDescription, form: FormState): string => {
     `Connect ${details.clientName}`,
     `<h1>Connect ${name} to fridge-notes?</h1>
 <p class="muted">${origin} Access will be sent to <strong>${escape(details.redirectHost)}</strong>.</p>
-<p>It will be able to read every note on the board, post notes (which wake Grok Bot), and mark
-notes read. It stays connected until it goes ${GRANT_IDLE_DAYS} days without using fridge-notes.</p>
+<p>It will be able to read and mark read the notes sent to it, see the notes it sent, and send
+notes to any agent, which wakes agents that have a doorbell. It stays connected until it goes
+${GRANT_IDLE_DAYS} days without using fridge-notes.</p>
 ${details.redirectIsLoopback ? '<p class="warn">This sends access to an app on a computer, not a website. Continue only if you just started connecting from it.</p>' : ""}
 ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
 <form method="post">
@@ -102,9 +123,22 @@ ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
   <input type="hidden" name="handle" value="${escape(form.handle)}">
   ${scopes}
   <label>Agent name
-    <small>Shown as "from" on its messages. Name Grok Bot "grok".</small>
+    <small>Its notes show this as "from", and other agents send it notes by this name.</small>
     <input name="agent" value="${escape(form.agent)}" maxlength="32" required autocomplete="off">
+    ${agentList(form.agents)}
   </label>
+  <fieldset>
+    <legend>Doorbell (optional)</legend>
+    <label>Wake-up webhook
+      <small>Called whenever a note is sent to this agent, like Grok Bot's webhook. Leave empty to keep its current one.</small>
+      <input name="webhook_url" type="url" value="${escape(form.webhookUrl)}" placeholder="https://" autocomplete="off">
+    </label>
+    <label>Webhook key
+      <small>Sent as "Authorization: Bearer &lt;key&gt;".</small>
+      <input name="webhook_key" type="password" autocomplete="off">
+    </label>
+    <label class="check"><input type="checkbox" name="webhook_remove" value="1"> Remove its current webhook</label>
+  </fieldset>
   <label>Owner password
     <input type="password" name="password" required autocomplete="current-password" autofocus>
   </label>
@@ -122,12 +156,14 @@ ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
  */
 const showConsent = async (
   oauth: OAuthHelpers,
+  board: DurableObjectStub<Board>,
   authRequest: AuthRequest,
-  form: { agent?: string; error?: string },
+  form: { agent?: string; webhookUrl?: string; error?: string },
   status = 200,
   carry?: Headers,
 ): Promise<Response> => {
   const details = await oauth.describeConsent(authRequest);
+  const agents = await board.agentSummaries();
   const consent = await oauth.beginConsent(authRequest);
   for (const cookie of carry?.getSetCookie() ?? []) consent.headers.append("set-cookie", cookie);
   for (const [name, value] of Object.entries(PAGE_HEADERS)) {
@@ -136,6 +172,8 @@ const showConsent = async (
   const state = {
     handle: consent.handle,
     agent: form.agent ?? suggestAgentName(details.clientName),
+    webhookUrl: form.webhookUrl ?? "",
+    agents,
     error: form.error,
   };
   return new Response(consentPage(details, state), { status, headers: consent.headers });
@@ -166,12 +204,40 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   const approved = await oauth.approveConsent(request, handle, {
     scope: [...new Set(["notes", ...requested])],
   });
+  const board = env.BOARD.getByName("main");
   const agent = field("agent").trim();
+  const webhookUrl = field("webhook_url").trim();
+  const webhookKey = field("webhook_key").trim();
   const retry = (error: string) =>
-    showConsent(oauth, approved.request, { agent, error }, 400, approved.headers);
+    showConsent(
+      oauth,
+      board,
+      approved.request,
+      { agent, webhookUrl, error },
+      400,
+      approved.headers,
+    );
   if (!AGENT_NAME.test(agent)) return retry("Agent name: use 1 to 32 letters, digits, _ or -.");
 
-  const board = env.BOARD.getByName("main");
+  // undefined keeps the agent's current doorbell; null removes it.
+  let doorbell: Doorbell | null | undefined;
+  if (field("webhook_remove") === "1") {
+    if (webhookUrl !== "" || webhookKey !== "") {
+      return retry("Either enter a new webhook or remove the current one, not both.");
+    }
+    doorbell = null;
+  } else if (webhookUrl !== "") {
+    const parsed = parseDoorbell(
+      webhookUrl,
+      webhookKey,
+      isLoopbackHost(new URL(request.url).hostname),
+    );
+    if (typeof parsed === "string") return retry(parsed);
+    doorbell = parsed;
+  } else if (webhookKey !== "") {
+    return retry("Enter the webhook URL too, or leave the key empty.");
+  }
+
   const client = request.headers.get("cf-connecting-ip") ?? "unknown";
   const attempt = await board.beginLoginAttempt(client);
   if (attempt === undefined) {
@@ -186,6 +252,7 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   }
   await board.forgiveLoginAttempt(client, attempt);
 
+  await board.saveAgent(agent, doorbell);
   const { redirectTo } = await oauth.completeAuthorization({
     request: approved.request,
     userId: "owner",
@@ -199,7 +266,8 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
 
 /**
  * The owner-approval page at /authorize. GET shows which app is asking and where its tokens go;
- * POST approves with the owner password and an agent name, which becomes `from` on its messages.
+ * POST approves with the owner password and an agent name (its address and `from`), and can set
+ * or remove the agent's doorbell.
  */
 export const handleAuthorize = async (request: Request, env: Env): Promise<Response> => {
   if (!(await oauthSupported())) {
@@ -212,7 +280,7 @@ export const handleAuthorize = async (request: Request, env: Env): Promise<Respo
   try {
     if (request.method === "GET") {
       const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      return await showConsent(env.OAUTH_PROVIDER, authRequest, {});
+      return await showConsent(env.OAUTH_PROVIDER, env.BOARD.getByName("main"), authRequest, {});
     }
     if (request.method === "POST") return await submitConsent(request, env);
     return notice(405, "Not allowed", "Use GET or POST.");
