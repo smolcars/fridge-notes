@@ -1,0 +1,12 @@
+{
+  // Keep this file within the subset celld accepts (no `routes`, `observability`, etc.)
+  // so the same config deploys to Cloudflare (`wrangler deploy`) and celld (`celld deploy`).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fridge-notes",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [{ "name": "BOARD", "class_name": "Board" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Board"] }],
+}

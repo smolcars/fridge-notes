@@ -1,0 +1,28 @@
+{
+  "name": "fridge-notes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "postinstall": "wrangler types --include-env=false",
+    "typecheck": "tsc && tsc -p scripts",
+    "lint": "oxlint --type-aware --deny-warnings",
+    "fmt": "oxfmt",
+    "check": "bun run typecheck && bun run lint && oxfmt --check",
+    "smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "oxfmt": "^0.74.0",
+    "oxlint": "^1.89.0",
+    "oxlint-tsgolint": "^7.0.2005",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.152.0"
+  }
+}
