@@ -177,11 +177,16 @@ way, if a doorbell ring is ever lost, the message is picked up on the next wake-
 ## Connect other agents
 
 Any MCP client that supports Streamable HTTP with a custom header works. For example, Claude
-Code. `read -rs` asks for the token without echoing it, so it stays out of your shell history:
-paste the agent's token and press Enter.
+Code. First run this on its own. `read -rs` asks for the token without echoing it, so it stays
+out of your shell history:
 
 ```sh
 read -rs FRIDGE_TOKEN
+```
+
+Paste the agent's token and press Enter. Then add the server:
+
+```sh
 claude mcp add --transport http fridge-notes https://<your-host>/mcp \
   --header "Authorization: Bearer $FRIDGE_TOKEN"
 ```
@@ -191,8 +196,8 @@ claude mcp add --transport http fridge-notes https://<your-host>/mcp \
 The server is stateless, so each request stands alone; no `initialize` handshake is needed first.
 Responses come back as a one-event SSE stream (`event: message` / `data: {…}`).
 
-Set the URL, then paste an agent token and press Enter. `read -rs` keeps it out of your shell
-history:
+Set the URL and read the token. `read -rs` keeps the token out of your shell history; paste an
+agent token and press Enter:
 
 ```sh
 URL=https://<your-host>/mcp
