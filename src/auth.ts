@@ -10,26 +10,33 @@ const sha256 = async (value: string): Promise<string> => {
 };
 
 /**
+ * One `AUTH_TOKENS` entry, `name:token`, or null if it's malformed. The only parser for entries,
+ * so no caller can mistake part of a token for a name.
+ */
+const parseEntry = (entry: string): { name: string; token: string } | null => {
+  const separator = entry.indexOf(":");
+  if (separator === -1) return null;
+  const name = entry.slice(0, separator).trim();
+  const token = entry.slice(separator + 1).trim();
+  const valid =
+    AGENT_NAME.test(name) && token.length >= MIN_SECRET_LENGTH && STATIC_TOKEN.test(token);
+  return valid ? { name, token } : null;
+};
+
+/**
  * Parses `AUTH_TOKENS`: comma-separated `name:token` pairs, one per agent, e.g.
  * `grok:3f9c...,claude:a71b...`. The name becomes the `from` of every message the agent posts.
  * Throws on any malformed entry so a typo fails closed instead of silently dropping an agent.
  */
 const parseTokens = async (config: string): Promise<Map<string, string>> => {
   const entries = config.split(",").map((entry, index) => {
-    const separator = entry.indexOf(":");
-    const name = entry.slice(0, separator).trim();
-    const token = entry.slice(separator + 1).trim();
-    if (
-      separator === -1 ||
-      !AGENT_NAME.test(name) ||
-      token.length < MIN_SECRET_LENGTH ||
-      !STATIC_TOKEN.test(token)
-    ) {
+    const parsed = parseEntry(entry);
+    if (parsed === null) {
       throw new Error(
         `AUTH_TOKENS entry ${index + 1} must be name:token: a name of letters, digits, _ or -, and a token of ${MIN_SECRET_LENGTH}+ letters, digits or - . _ ~ + /`,
       );
     }
-    return { name, token };
+    return parsed;
   });
   return new Map(
     await Promise.all(entries.map(async ({ name, token }) => [await sha256(token), name] as const)),
@@ -51,13 +58,14 @@ export const agentForToken = async (
 
 /**
  * The agent names in `AUTH_TOKENS`, so notes can be addressed to them before they first connect.
- * Skips malformed entries instead of throwing: a typo there must not stop OAuth agents posting.
+ * Skips malformed entries, whole, instead of throwing: a typo there must not stop OAuth agents
+ * posting, and must never turn a pasted token into a visible "name".
  */
 export const fixedAgentNames = (config: string | undefined): string[] =>
-  (config ?? "")
-    .split(",")
-    .map((entry) => entry.slice(0, entry.indexOf(":")).trim())
-    .filter((name) => AGENT_NAME.test(name));
+  (config ?? "").split(",").flatMap((entry) => {
+    const parsed = parseEntry(entry);
+    return parsed === null ? [] : [parsed.name];
+  });
 
 /** True if `OWNER_PASSWORD` is set and long enough to resist guessing. */
 export const ownerPasswordConfigured = (expected: string | undefined): expected is string =>
