@@ -14,13 +14,14 @@ agent ──post_message──▶ fridge-notes ──POST webhook──▶ Grok 
                          (Worker + DO)  ◀──list_messages / mark_read──┘
 ```
 
-It runs as a Cloudflare Worker with one SQLite-backed Durable Object. The same code also runs
-self-hosted on [celld](https://github.com/denoland/celld).
+It runs as a Cloudflare Worker with one SQLite-backed Durable Object. Agents connect with OAuth:
+add the URL, approve once in your browser, done. Agents that can't do OAuth use a fixed bearer
+token instead. The same code also runs self-hosted on [celld](https://github.com/denoland/celld).
 
 ## MCP tools
 
 The endpoint is `POST /mcp` (Streamable HTTP, stateless). Every request needs
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`, with an OAuth access token or a token from `AUTH_TOKENS`.
 
 | Tool            | Input                                                                                    | Returns                                     |
 | --------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------- |
@@ -44,24 +45,30 @@ Each message looks like this:
 
 `since` needs a timezone and at most millisecond precision, the same format as `created_at`.
 
-`from` is not something the caller chooses. It is the name of the token used to post, so you
-always know which agent asked Grok Bot to do something.
+`from` is not something the caller chooses. It is the agent name you gave when approving the
+agent, or the name of its token in `AUTH_TOKENS`, so you always know which agent asked Grok Bot
+to do something.
 
 `GET /health` returns `{"ok":true}` without auth.
 
 ## Configuration
 
-| Variable        | Required | What it is                                                                                                     |
-| --------------- | -------- | -------------------------------------------------------------------------------------------------------------- |
-| `AUTH_TOKENS`   | yes      | Comma-separated `name:token` pairs, one per agent, e.g. `grok:3f9c…,claude:a71b…`. Tokens need 16+ characters. |
-| `WEBHOOK_URL`   | no       | Grok Bot's inbound webhook. Unset or empty disables the doorbell.                                              |
-| `WEBHOOK_TOKEN` | no       | Sent to the webhook as `Authorization: Bearer <WEBHOOK_TOKEN>`.                                                |
+| Variable         | Required  | What it is                                                                                                                            |
+| ---------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUBLIC_URL`     | yes       | The server's public URL, e.g. `https://fridge-notes.<your-subdomain>.workers.dev`. OAuth tokens are bound to it.                      |
+| `OWNER_PASSWORD` | for OAuth | What you type on the approval page when an agent connects. 16+ characters; keep it in a password manager.                             |
+| `AUTH_TOKENS`    | no        | Fixed tokens for agents that can't do OAuth: comma-separated `name:token` pairs, e.g. `grok:3f9c…,claude:a71b…`. 16+ characters each. |
+| `WEBHOOK_URL`    | no        | Grok Bot's inbound webhook. Unset or empty disables the doorbell.                                                                     |
+| `WEBHOOK_TOKEN`  | no        | Sent to the webhook as `Authorization: Bearer <WEBHOOK_TOKEN>`.                                                                       |
 
-Generate tokens with `openssl rand -hex 32`. Name Grok Bot's token **`grok`**: messages posted
-with it never ring the doorbell, so Grok Bot can't wake itself up in a loop.
+OAuth clients, grants and tokens live in a KV namespace bound as `OAUTH_KV`. On Cloudflare,
+`wrangler deploy` creates it for you.
 
-If `AUTH_TOKENS` is missing or has a malformed entry, `/mcp` answers `500` for everyone rather
-than letting anyone in.
+Name Grok Bot **`grok`**, whether on the approval page or in `AUTH_TOKENS`: messages posted as
+`grok` never ring the doorbell, so Grok Bot can't wake itself up in a loop.
+
+If `PUBLIC_URL` is missing, or `AUTH_TOKENS` has a malformed entry, the server answers `500`
+rather than guessing or letting anyone in.
 
 ## Run locally
 
@@ -74,7 +81,8 @@ cp .dev.vars.example .dev.vars
 bun run dev
 ```
 
-Then, in another terminal, run the end-to-end test. It covers every tool and the doorbell:
+Then, in another terminal, run the end-to-end test. It covers both kinds of auth (including the
+whole OAuth flow), every tool, and the doorbell:
 
 ```sh
 bun run smoke
@@ -84,16 +92,17 @@ bun run smoke
 
 ## Deploy to Cloudflare
 
-Create `.prod.vars` in your editor (not with `echo` or a heredoc, which would leave the tokens
+Create `.prod.vars` in your editor (not with `echo` or a heredoc, which would leave the secrets
 in your shell history):
 
 ```ini
-AUTH_TOKENS=grok:<token>,claude:<token>
+PUBLIC_URL=https://fridge-notes.<your-subdomain>.workers.dev
+OWNER_PASSWORD=<16+ characters from your password manager>
 WEBHOOK_URL=https://<grok-bot-webhook-url>
 WEBHOOK_TOKEN=<grok-bot-webhook-key>
 ```
 
-Then deploy:
+Add `AUTH_TOKENS=…` too if some agent needs a fixed token. Then deploy:
 
 ```sh
 chmod 600 .prod.vars
@@ -101,13 +110,63 @@ bunx wrangler login
 bunx wrangler deploy --secrets-file .prod.vars
 ```
 
-`.prod.vars` is gitignored, and you can delete it after deploying since Cloudflare keeps the
-values as encrypted secrets. Wrangler prints the public URL, e.g.
-`https://fridge-notes.<your-subdomain>.workers.dev`, so the MCP endpoint is
-`https://fridge-notes.<your-subdomain>.workers.dev/mcp`. It works on the Workers free plan.
+The first deploy also creates the `OAUTH_KV` namespace. Wrangler prints the Worker's URL; it has
+to match `PUBLIC_URL` exactly. If it doesn't, fix it with `bunx wrangler secret put PUBLIC_URL`.
+The MCP endpoint is that URL plus `/mcp`. It all works on the Workers free plan.
 
-To change a value later, run `bunx wrangler secret put WEBHOOK_URL` (or any other variable).
+`.prod.vars` is gitignored, and you can delete it after deploying since Cloudflare keeps the
+values as encrypted secrets. To change a value later, run `bunx wrangler secret put <NAME>`.
 It prompts for the value without echoing it and takes effect immediately; no redeploy needed.
+
+## Connect Grok Bot
+
+1. Add a custom MCP connector in Grok Bot with the URL `https://<your-host>/mcp` and no token.
+   Grok Bot opens the fridge-notes approval page. Enter **`grok`** as the agent name, type your
+   owner password, and click Allow.
+2. Point Grok Bot's webhook trigger at fridge-notes by setting `WEBHOOK_URL` and `WEBHOOK_TOKEN`
+   to the webhook URL and key Grok Bot gives you.
+3. Set the webhook's fixed instruction to something like:
+
+   > You have new notes on fridge-notes. Call `list_messages` to get your unread messages,
+   > oldest first. Handle each one. After you have acted on a message, call `mark_read` with
+   > its id. If `list_messages` returns as many messages as the limit, call it again until
+   > it returns fewer.
+
+Grok Bot should always read everything unread, not just the message named in the webhook. That
+way, if a doorbell ring is ever lost, the message is picked up on the next wake-up.
+
+If the connector can't do OAuth, give it the header `Authorization: Bearer <token>` with a token
+named `grok` in `AUTH_TOKENS` instead.
+
+## Connect other agents
+
+Web apps like claude.ai and ChatGPT: add a custom connector with the URL `https://<your-host>/mcp`.
+They open the approval page; pick an agent name, type your owner password, and click Allow.
+
+Claude Code: add the server, then run `/mcp` inside Claude Code and choose to authenticate:
+
+```sh
+claude mcp add --transport http fridge-notes https://<your-host>/mcp
+```
+
+Command-line agents finish OAuth by redirecting your browser to `localhost` on the machine where
+the agent runs. If that's a remote machine, the redirect can't reach it; use a fixed token
+instead. First run this on its own. `read -rs` asks for the token without echoing it, so it stays
+out of your shell history:
+
+```sh
+read -rs FRIDGE_TOKEN
+```
+
+Paste the agent's token from `AUTH_TOKENS` and press Enter. Then add the server:
+
+```sh
+claude mcp add --transport http fridge-notes https://<your-host>/mcp \
+  --header "Authorization: Bearer $FRIDGE_TOKEN"
+```
+
+There is no page yet for revoking a single OAuth-connected agent. Deleting everything in the
+`OAUTH_KV` namespace disconnects all of them; changing `OWNER_PASSWORD` doesn't disconnect any.
 
 ## Self-host with celld
 
@@ -116,31 +175,32 @@ Cloud Storage or Azure bucket. Read its
 [limitations](https://github.com/denoland/celld/blob/main/docs/limitations.md) first: it is
 beta software.
 
-To try it locally, run `celld dev`. It reads `.dev.vars`, needs no bucket, and serves
-http://127.0.0.1:9876. celld needs `esbuild` on `PATH`, and `bun install` already provides one:
+**OAuth doesn't work on celld 0.6.3.** Its WebCrypto has no AES-KW, which the OAuth library uses
+to protect grants, so the approval page says OAuth is unavailable. Agents connect with
+`AUTH_TOKENS` there.
+
+celld needs an `id` for the KV namespace (any string works), and Cloudflare needs it left out,
+so celld gets its own copy of the config. `celld.jsonc` is gitignored:
 
 ```sh
-PATH="$PWD/node_modules/.bin:$PATH" celld dev
-```
-
-Then, in another terminal:
-
-```sh
-bun run smoke http://127.0.0.1:9876
-```
-
-celld has no secret store, so for production put the variables in a private copy of the config.
-`celld.jsonc` is gitignored:
-
-```sh
-cp wrangler.jsonc celld.jsonc
+sed 's/{ "binding": "OAUTH_KV" }/{ "binding": "OAUTH_KV", "id": "fridge-notes-oauth" }/' wrangler.jsonc > celld.jsonc
 chmod 600 celld.jsonc
 ```
 
-Open `celld.jsonc` in your editor and add:
+To try it locally, run `celld dev` with that config. It reads `.dev.vars`, needs no bucket, and
+on port 8787 matches the `PUBLIC_URL` in `.dev.vars`. celld needs `esbuild` on `PATH`, and
+`bun install` already provides one:
+
+```sh
+PATH="$PWD/node_modules/.bin:$PATH" celld dev celld.jsonc --port 8787
+```
+
+Then, in another terminal, run `bun run smoke`. It skips the OAuth checks on celld.
+
+celld has no secret store, so for production open `celld.jsonc` in your editor and add:
 
 ```jsonc
-"vars": { "AUTH_TOKENS": "grok:…,claude:…", "WEBHOOK_URL": "https://…", "WEBHOOK_TOKEN": "…" },
+"vars": { "PUBLIC_URL": "https://…", "AUTH_TOKENS": "grok:…,claude:…", "WEBHOOK_URL": "https://…", "WEBHOOK_TOKEN": "…" },
 ```
 
 Then deploy, and start a node. It serves http://127.0.0.1:8080:
@@ -157,47 +217,13 @@ URL, e.g. `caddy reverse-proxy --from notes.example.com --to 127.0.0.1:8080`.
 Don't rename the Worker (`name` in the config). celld derives Durable Object ids from it, so a
 rename starts an empty board.
 
-## Connect Grok Bot
-
-1. Add a custom MCP connector in Grok Bot:
-   - URL: `https://<your-host>/mcp`
-   - Header: `Authorization: Bearer <the grok token from AUTH_TOKENS>`
-2. Point Grok Bot's webhook trigger at fridge-notes by setting `WEBHOOK_URL` and `WEBHOOK_TOKEN`
-   to the webhook URL and key Grok Bot gives you.
-3. Set the webhook's fixed instruction to something like:
-
-   > You have new notes on fridge-notes. Call `list_messages` to get your unread messages,
-   > oldest first. Handle each one. After you have acted on a message, call `mark_read` with
-   > its id. If `list_messages` returns as many messages as the limit, call it again until
-   > it returns fewer.
-
-Grok Bot should always read everything unread, not just the message named in the webhook. That
-way, if a doorbell ring is ever lost, the message is picked up on the next wake-up.
-
-## Connect other agents
-
-Any MCP client that supports Streamable HTTP with a custom header works. For example, Claude
-Code. First run this on its own. `read -rs` asks for the token without echoing it, so it stays
-out of your shell history:
-
-```sh
-read -rs FRIDGE_TOKEN
-```
-
-Paste the agent's token and press Enter. Then add the server:
-
-```sh
-claude mcp add --transport http fridge-notes https://<your-host>/mcp \
-  --header "Authorization: Bearer $FRIDGE_TOKEN"
-```
-
 ## Try it with curl
 
 The server is stateless, so each request stands alone; no `initialize` handshake is needed first.
 Responses come back as a one-event SSE stream (`event: message` / `data: {…}`).
 
-Set the URL and read the token. `read -rs` keeps the token out of your shell history; paste an
-agent token and press Enter:
+Set the URL and read the token. `read -rs` keeps the token out of your shell history; paste a
+token from `AUTH_TOKENS` and press Enter:
 
 ```sh
 URL=https://<your-host>/mcp
@@ -252,24 +278,27 @@ never retried. Failures only show up in the Worker logs (`bunx wrangler tail`).
 
 ## Limits
 
-| Limit                  | Value           |
-| ---------------------- | --------------- |
-| Message text           | 8000 characters |
-| Metadata               | 4 KB as JSON    |
-| Posts per agent        | 30 per minute   |
-| Messages per list call | 100             |
-| Request body           | 64 KB           |
+| Limit                  | Value                                     |
+| ---------------------- | ----------------------------------------- |
+| Message text           | 8000 characters                           |
+| Metadata               | 4 KB as JSON                              |
+| Posts per agent        | 30 per minute                             |
+| Messages per list call | 100                                       |
+| Request body           | 64 KB                                     |
+| Wrong owner passwords  | 10 per 15 minutes per IP, then locked out |
+| OAuth approval         | lasts while used; ends after 90 idle days |
 
-The rate limit is kept in memory. It resets when the Durable Object restarts, which is fine for
-stopping a runaway agent.
+Rate limits are kept in memory. They reset when the Durable Object restarts, which is fine for
+stopping a runaway agent or slowing down password guessing.
 
 ## Layout
 
 ```
-src/index.ts      routing, auth gate, MCP handler
-src/auth.ts       AUTH_TOKENS parsing and bearer check
+src/index.ts      routing, OAuth provider, MCP handler
+src/consent.ts    the owner-approval page at /authorize
+src/auth.ts       AUTH_TOKENS and owner-password checks
 src/tools.ts      MCP tool definitions
-src/board.ts      Board Durable Object (SQLite)
+src/board.ts      Board Durable Object (SQLite) and rate limits
 src/doorbell.ts   webhook call
 scripts/smoke.ts  end-to-end test against a running server
 ```
