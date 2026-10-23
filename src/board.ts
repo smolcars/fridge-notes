@@ -49,10 +49,12 @@ const LOGIN_WINDOW_MS = 15 * 60_000;
 /**
  * Two agents with doorbells could wake each other forever by replying to every reply. After this
  * many exchanges between the same two agents, each within EXCHANGE_WINDOW_MS of the last, their
- * notes still arrive but stop ringing until the pair has been quiet for that long.
+ * notes still arrive but stop ringing until EXCHANGE_WINDOW_MS after the last ring.
  */
 export const MAX_EXCHANGES = 10;
 const EXCHANGE_WINDOW_MS = 10 * 60_000;
+/** The longest window anything is counted over, so older counter rows can be dropped. */
+const LONGEST_WINDOW_MS = Math.max(LOGIN_WINDOW_MS, EXCHANGE_WINDOW_MS);
 
 type MessageRow = {
   id: number;
@@ -89,10 +91,6 @@ const toMessage = (row: MessageRow): Message => ({
  */
 export class Board extends DurableObject {
   readonly #sql: SqlStorage;
-  // In-memory, so limits reset when the object is evicted. Good enough to stop a runaway agent,
-  // slow down password guessing, or break a loop between two agents.
-  readonly #windows = new Map<string, { start: number; count: number }>();
-  readonly #exchanges = new Map<string, { lastFrom: string; count: number; at: number }>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -120,6 +118,23 @@ export class Board extends DurableObject {
       )
     `);
     this.#addColumn("agents", "doorbell_off INTEGER NOT NULL DEFAULT 0");
+    // Counters live in SQLite, not memory: an idle Durable Object is evicted within seconds, and a
+    // limit that resets then wouldn't stop slow password guessing or a slow loop.
+    this.#sql.exec(`
+      CREATE TABLE IF NOT EXISTS limits (
+        key TEXT PRIMARY KEY,
+        start INTEGER NOT NULL,
+        count INTEGER NOT NULL
+      )
+    `);
+    this.#sql.exec(`
+      CREATE TABLE IF NOT EXISTS exchanges (
+        pair TEXT PRIMARY KEY,
+        last_from TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        at INTEGER NOT NULL
+      )
+    `);
   }
 
   /**
@@ -214,9 +229,12 @@ export class Board extends DurableObject {
     }));
   }
 
-  /** For the approval page, after the owner's password: whether reusing `name` shares a mailbox. */
-  agentExists(name: string): boolean {
-    return this.#sql.exec("SELECT 1 FROM agents WHERE name = ?", name).toArray().length > 0;
+  /**
+   * For the approval page, after the owner's password: whether `name` already has a mailbox,
+   * counting agents that so far exist only in settings.
+   */
+  agentExists(name: string, fixed: FixedAgents): boolean {
+    return this.#knownNames(fixed).includes(name);
   }
 
   /**
@@ -252,8 +270,11 @@ export class Board extends DurableObject {
    * to the window it was counted in: a late refund must not erase a failure in a newer window.
    */
   forgiveLoginAttempt(client: string, windowStart: number): void {
-    const window = this.#windows.get(`login:${client}`);
-    if (window?.start === windowStart && window.count > 0) window.count--;
+    this.#sql.exec(
+      "UPDATE limits SET count = count - 1 WHERE key = ? AND start = ? AND count > 0",
+      `login:${client}`,
+      windowStart,
+    );
   }
 
   /** Agents exist from their approval or their first call, so others can address them. */
@@ -292,25 +313,39 @@ export class Board extends DurableObject {
 
   /**
    * Counts how often two agents' rings have gone back and forth. One-way notes never count, so
-   * only a reply-to-reply loop between two agents with doorbells is ever held back.
+   * only a reply-to-reply loop between two agents with doorbells is ever held back. A held-back
+   * note doesn't extend the pause, so the pair rings again EXCHANGE_WINDOW_MS after its last ring.
    */
   #allowExchange(from: string, to: string): boolean {
     const pair = [from, to].toSorted().join("\n");
     const now = Date.now();
-    const state = this.#exchanges.get(pair);
-    if (state === undefined || now - state.at >= EXCHANGE_WINDOW_MS) {
-      if (this.#exchanges.size > 1_000) {
-        for (const [key, stale] of this.#exchanges) {
-          if (now - stale.at >= EXCHANGE_WINDOW_MS) this.#exchanges.delete(key);
-        }
-      }
-      this.#exchanges.set(pair, { lastFrom: from, count: 0, at: now });
-      return true;
+    const state = this.#sql
+      .exec<{ last_from: string; count: number; at: number }>(
+        "SELECT last_from, count, at FROM exchanges WHERE pair = ?",
+        pair,
+      )
+      .toArray()[0];
+    const fresh = state === undefined || now - state.at >= EXCHANGE_WINDOW_MS;
+    const count = fresh ? 0 : state.count + (state.last_from === from ? 0 : 1);
+    if (count >= MAX_EXCHANGES) {
+      // Held back: remember the direction and count, but keep `at`, the time of the last ring.
+      this.#sql.exec(
+        "UPDATE exchanges SET last_from = ?, count = ? WHERE pair = ?",
+        from,
+        count,
+        pair,
+      );
+      return false;
     }
-    if (state.lastFrom !== from) state.count++;
-    state.lastFrom = from;
-    state.at = now;
-    return state.count < MAX_EXCHANGES;
+    if (fresh) this.#sql.exec("DELETE FROM exchanges WHERE at < ?", now - EXCHANGE_WINDOW_MS);
+    this.#sql.exec(
+      "INSERT OR REPLACE INTO exchanges (pair, last_from, count, at) VALUES (?, ?, ?, ?)",
+      pair,
+      from,
+      count,
+      now,
+    );
+    return true;
   }
 
   /** Adds a column to an existing table; a no-op once it's there. */
@@ -324,26 +359,29 @@ export class Board extends DurableObject {
 
   /** Events for `key` in its current fixed window. */
   #count(key: string, windowMs: number): number {
-    const window = this.#windows.get(key);
-    return window === undefined || Date.now() - window.start >= windowMs ? 0 : window.count;
+    const row = this.#sql
+      .exec<{ start: number; count: number }>("SELECT start, count FROM limits WHERE key = ?", key)
+      .toArray()[0];
+    return row === undefined || Date.now() - row.start >= windowMs ? 0 : row.count;
   }
 
   /** Records an event for `key` and returns its current fixed window. */
   #hit(key: string, windowMs: number): { start: number; count: number } {
     const now = Date.now();
-    if (this.#windows.size > 1_000) {
-      // Login keys are per client IP, so drop finished windows before the map can grow unbounded.
-      for (const [stale, window] of this.#windows) {
-        if (now - window.start >= LOGIN_WINDOW_MS) this.#windows.delete(stale);
-      }
+    const row = this.#sql
+      .exec<{ start: number; count: number }>("SELECT start, count FROM limits WHERE key = ?", key)
+      .toArray()[0];
+    if (row === undefined || now - row.start >= windowMs) {
+      // Login keys are per client IP, so drop finished windows before the table grows.
+      this.#sql.exec("DELETE FROM limits WHERE start < ?", now - LONGEST_WINDOW_MS);
+      this.#sql.exec(
+        "INSERT OR REPLACE INTO limits (key, start, count) VALUES (?, ?, 1)",
+        key,
+        now,
+      );
+      return { start: now, count: 1 };
     }
-    const window = this.#windows.get(key);
-    if (window === undefined || now - window.start >= windowMs) {
-      const fresh = { start: now, count: 1 };
-      this.#windows.set(key, fresh);
-      return fresh;
-    }
-    window.count++;
-    return window;
+    this.#sql.exec("UPDATE limits SET count = count + 1 WHERE key = ?", key);
+    return { start: row.start, count: row.count + 1 };
   }
 }
