@@ -1,0 +1,11 @@
+# Copy to .dev.vars for `bun run dev` / `celld dev`. These values match the smoke test defaults.
+# Never use them in production: generate real tokens with `openssl rand -hex 32`.
+
+# One `name:token` pair per agent. The name becomes `from` on that agent's messages.
+# The agent named `grok` is Grok Bot: its own posts never ring the doorbell.
+AUTH_TOKENS=grok:dev-grok-token-0000,agent:dev-agent-token-0000
+
+# Grok Bot's inbound webhook (the doorbell) and the bearer key it expects. Leave WEBHOOK_URL
+# empty to disable the doorbell.
+WEBHOOK_URL=http://127.0.0.1:8788/webhook
+WEBHOOK_TOKEN=dev-webhook-token
