@@ -18,6 +18,8 @@ export interface ListOptions {
 }
 
 export const POSTS_PER_MINUTE = 30;
+export const LOGIN_FAILURES = 10;
+const LOGIN_WINDOW_MS = 15 * 60_000;
 
 type MessageRow = {
   id: number;
@@ -40,8 +42,9 @@ const toMessage = (row: MessageRow): Message => ({
 /** The single message board. One instance, addressed by name, holds every message in SQLite. */
 export class Board extends DurableObject {
   readonly #sql: SqlStorage;
-  // In-memory, so it resets when the object is evicted. Good enough to stop a runaway agent.
-  readonly #postWindows = new Map<string, { start: number; count: number }>();
+  // In-memory, so limits reset when the object is evicted. Good enough to stop a runaway agent
+  // or slow down password guessing.
+  readonly #windows = new Map<string, { start: number; count: number }>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -61,7 +64,9 @@ export class Board extends DurableObject {
 
   /** `metadata` is a JSON object serialized by the caller. */
   post(from: string, text: string, metadata: string | undefined): Message {
-    this.#checkRateLimit(from);
+    if (this.#hit(`post:${from}`, 60_000) > POSTS_PER_MINUTE) {
+      throw new Error(`Rate limit exceeded: at most ${POSTS_PER_MINUTE} posts per minute`);
+    }
     const row = this.#sql
       .exec<MessageRow>(
         "INSERT INTO messages (text, sender, created_at, metadata) VALUES (?, ?, ?, ?) RETURNING *",
@@ -113,16 +118,36 @@ export class Board extends DurableObject {
       .toArray().length;
   }
 
-  #checkRateLimit(from: string): void {
+  /** True once `client` has entered the owner password wrong too often in the current window. */
+  loginLocked(client: string): boolean {
+    return this.#count(`login:${client}`, LOGIN_WINDOW_MS) >= LOGIN_FAILURES;
+  }
+
+  /** Only failures count, so the owner never locks themselves out by approving apps. */
+  recordLoginFailure(client: string): void {
+    this.#hit(`login:${client}`, LOGIN_WINDOW_MS);
+  }
+
+  /** Events for `key` in its current fixed window. */
+  #count(key: string, windowMs: number): number {
+    const window = this.#windows.get(key);
+    return window === undefined || Date.now() - window.start >= windowMs ? 0 : window.count;
+  }
+
+  /** Records an event for `key` and returns the count in its current fixed window. */
+  #hit(key: string, windowMs: number): number {
     const now = Date.now();
-    const window = this.#postWindows.get(from);
-    if (window === undefined || now - window.start >= 60_000) {
-      this.#postWindows.set(from, { start: now, count: 1 });
-      return;
+    if (this.#windows.size > 1_000) {
+      // Login keys are per client IP, so drop finished windows before the map can grow unbounded.
+      for (const [stale, window] of this.#windows) {
+        if (now - window.start >= LOGIN_WINDOW_MS) this.#windows.delete(stale);
+      }
     }
-    if (window.count >= POSTS_PER_MINUTE) {
-      throw new Error(`Rate limit exceeded: at most ${POSTS_PER_MINUTE} posts per minute`);
+    const window = this.#windows.get(key);
+    if (window === undefined || now - window.start >= windowMs) {
+      this.#windows.set(key, { start: now, count: 1 });
+      return 1;
     }
-    window.count++;
+    return ++window.count;
   }
 }
