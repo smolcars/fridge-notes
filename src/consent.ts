@@ -6,7 +6,7 @@ import {
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
 import { AGENT_NAME, ownerPasswordConfigured, passwordMatches } from "./auth.ts";
-import type { Board, Doorbell } from "./board.ts";
+import type { Doorbell } from "./board.ts";
 import { isLoopbackHost, parseDoorbell } from "./doorbell.ts";
 import type { Env } from "./index.ts";
 
@@ -78,26 +78,14 @@ const suggestAgentName = (clientName: string): string =>
     .replace(/^-+|-+$/g, "")
     .slice(0, 32) || "agent";
 
-type AgentSummary = Awaited<ReturnType<Board["agentSummaries"]>>[number];
-
 interface FormState {
   handle: string;
   agent: string;
-  /** Echoed back after a mistake so it needn't be retyped. The key never is. */
+  /** Echoed back after a mistake so they needn't be retyped. The key never is. */
   webhookUrl: string;
-  agents: AgentSummary[];
+  reuse: boolean;
   error?: string | undefined;
 }
-
-const agentList = (agents: AgentSummary[]): string =>
-  agents.length === 0
-    ? ""
-    : `<small>Existing agents: ${agents
-        .map(
-          ({ name, doorbellHost }) =>
-            `<strong>${escape(name)}</strong>${doorbellHost === null ? "" : ` (wakes via ${escape(doorbellHost)})`}`,
-        )
-        .join(", ")}. Reusing a name gives this app that agent's notes.</small>`;
 
 const consentPage = (details: ConsentDescription, form: FormState): string => {
   const name = escape(details.clientName);
@@ -125,8 +113,8 @@ ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
   <label>Agent name
     <small>Its notes show this as "from", and other agents send it notes by this name.</small>
     <input name="agent" value="${escape(form.agent)}" maxlength="32" required autocomplete="off">
-    ${agentList(form.agents)}
   </label>
+  <label class="check"><input type="checkbox" name="reuse" value="1"${form.reuse ? " checked" : ""}> I'm reconnecting an agent that already has this name</label>
   <fieldset>
     <legend>Doorbell (optional)</legend>
     <label>Wake-up webhook
@@ -156,14 +144,12 @@ ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
  */
 const showConsent = async (
   oauth: OAuthHelpers,
-  board: DurableObjectStub<Board>,
   authRequest: AuthRequest,
-  form: { agent?: string; webhookUrl?: string; error?: string },
+  form: { agent?: string; webhookUrl?: string; reuse?: boolean; error?: string },
   status = 200,
   carry?: Headers,
 ): Promise<Response> => {
   const details = await oauth.describeConsent(authRequest);
-  const agents = await board.agentSummaries();
   const consent = await oauth.beginConsent(authRequest);
   for (const cookie of carry?.getSetCookie() ?? []) consent.headers.append("set-cookie", cookie);
   for (const [name, value] of Object.entries(PAGE_HEADERS)) {
@@ -173,7 +159,7 @@ const showConsent = async (
     handle: consent.handle,
     agent: form.agent ?? suggestAgentName(details.clientName),
     webhookUrl: form.webhookUrl ?? "",
-    agents,
+    reuse: form.reuse ?? false,
     error: form.error,
   };
   return new Response(consentPage(details, state), { status, headers: consent.headers });
@@ -208,12 +194,12 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   const agent = field("agent").trim();
   const webhookUrl = field("webhook_url").trim();
   const webhookKey = field("webhook_key").trim();
+  const reuse = field("reuse") === "1";
   const retry = (error: string) =>
     showConsent(
       oauth,
-      board,
       approved.request,
-      { agent, webhookUrl, error },
+      { agent, webhookUrl, reuse, error },
       400,
       approved.headers,
     );
@@ -252,6 +238,13 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   }
   await board.forgiveLoginAttempt(client, attempt);
 
+  // Only now, with the owner's password checked, may the page reveal that a name is taken. Taking
+  // over an existing agent's notes has to be deliberate.
+  if (!reuse && (await board.agentExists(agent))) {
+    return retry(
+      `There's already an agent named "${agent}". To give this app its notes, tick "I'm reconnecting" and approve again; otherwise pick another name.`,
+    );
+  }
   await board.saveAgent(agent, doorbell);
   const { redirectTo } = await oauth.completeAuthorization({
     request: approved.request,
@@ -280,7 +273,7 @@ export const handleAuthorize = async (request: Request, env: Env): Promise<Respo
   try {
     if (request.method === "GET") {
       const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      return await showConsent(env.OAUTH_PROVIDER, env.BOARD.getByName("main"), authRequest, {});
+      return await showConsent(env.OAUTH_PROVIDER, authRequest, {});
     }
     if (request.method === "POST") return await submitConsent(request, env);
     return notice(405, "Not allowed", "Use GET or POST.");

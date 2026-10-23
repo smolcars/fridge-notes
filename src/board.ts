@@ -19,6 +19,12 @@ export interface Doorbell {
 }
 
 /**
+ * What to ring for a new note: the recipient's own doorbell, `"settings"` for the `WEBHOOK_*`
+ * doorbell (whose URL and key only the Worker knows), or nothing.
+ */
+export type Ring = Doorbell | "settings" | null;
+
+/**
  * Agents that come from settings rather than from approvals: fixed-token names, and the agent
  * the `WEBHOOK_*` settings wake.
  */
@@ -28,7 +34,7 @@ export interface FixedAgents {
 }
 
 /** A refusal (unknown recipient, rate limit) is a result, not a throw, so it isn't logged as a crash. */
-export type PostResult = { message: Message; doorbell: Doorbell | null } | { refused: string };
+export type PostResult = { message: Message; ring: Ring } | { refused: string };
 
 export interface ListOptions {
   unreadOnly: boolean;
@@ -40,6 +46,13 @@ export interface ListOptions {
 export const POSTS_PER_MINUTE = 30;
 export const LOGIN_FAILURES = 10;
 const LOGIN_WINDOW_MS = 15 * 60_000;
+/**
+ * Two agents with doorbells could wake each other forever by replying to every reply. After this
+ * many exchanges between the same two agents, each within EXCHANGE_WINDOW_MS of the last, their
+ * notes still arrive but stop ringing until the pair has been quiet for that long.
+ */
+export const MAX_EXCHANGES = 10;
+const EXCHANGE_WINDOW_MS = 10 * 60_000;
 
 type MessageRow = {
   id: number;
@@ -55,6 +68,8 @@ type AgentRow = {
   name: string;
   webhook_url: string | null;
   webhook_token: string | null;
+  /** 1 once the owner removed its doorbell: then the `WEBHOOK_*` doorbell doesn't apply either. */
+  doorbell_off: number;
 };
 
 const toMessage = (row: MessageRow): Message => ({
@@ -74,9 +89,10 @@ const toMessage = (row: MessageRow): Message => ({
  */
 export class Board extends DurableObject {
   readonly #sql: SqlStorage;
-  // In-memory, so limits reset when the object is evicted. Good enough to stop a runaway agent
-  // or slow down password guessing.
+  // In-memory, so limits reset when the object is evicted. Good enough to stop a runaway agent,
+  // slow down password guessing, or break a loop between two agents.
   readonly #windows = new Map<string, { start: number; count: number }>();
+  readonly #exchanges = new Map<string, { lastFrom: string; count: number; at: number }>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -91,11 +107,7 @@ export class Board extends DurableObject {
         metadata TEXT
       )
     `);
-    try {
-      this.#sql.exec("ALTER TABLE messages ADD COLUMN recipient TEXT");
-    } catch (error) {
-      if (!String(error).includes("duplicate column")) throw error;
-    }
+    this.#addColumn("messages", "recipient TEXT");
     this.#sql.exec(
       "CREATE INDEX IF NOT EXISTS messages_by_recipient ON messages (recipient, read, id)",
     );
@@ -107,11 +119,12 @@ export class Board extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    this.#addColumn("agents", "doorbell_off INTEGER NOT NULL DEFAULT 0");
   }
 
   /**
-   * Stores a note from `from` to `to` and returns it with `to`'s doorbell, if it has one. A note
-   * to yourself never rings. Refuses a `to` that isn't a known agent, so a typo can't vanish.
+   * Stores a note from `from` to `to` and says what to ring. Refuses a `to` that isn't a known
+   * agent, so a typo can't vanish.
    */
   post(
     from: string,
@@ -138,7 +151,7 @@ export class Board extends DurableObject {
         metadata ?? null,
       )
       .one();
-    return { message: toMessage(row), doorbell: to === from ? null : this.#doorbell(to) };
+    return { message: toMessage(row), ring: this.#ringFor(from, to, fixed) };
   }
 
   /** Notes addressed to `agent`, oldest first, so it can work through them in order. */
@@ -195,38 +208,30 @@ export class Board extends DurableObject {
   /** Every agent a note can be addressed to, and whether a note to it rings a doorbell. */
   agents(caller: string, fixed: FixedAgents): { name: string; has_doorbell: boolean }[] {
     this.#register(caller);
-    const withDoorbell = new Set(
-      this.#sql
-        .exec<{ name: string }>("SELECT name FROM agents WHERE webhook_url IS NOT NULL")
-        .toArray()
-        .map((row) => row.name),
-    );
-    if (fixed.doorbellAgent !== null) withDoorbell.add(fixed.doorbellAgent);
-    return this.#knownNames(fixed).map((name) => ({ name, has_doorbell: withDoorbell.has(name) }));
+    return this.#knownNames(fixed).map((name) => ({
+      name,
+      has_doorbell: this.#doorbellOf(name, fixed) !== null,
+    }));
   }
 
-  /** For the approval page: each agent and, if it has a doorbell, only the webhook's host. */
-  agentSummaries(): { name: string; doorbellHost: string | null }[] {
-    return this.#sql
-      .exec<AgentRow>("SELECT * FROM agents ORDER BY name")
-      .toArray()
-      .map((row) => ({
-        name: row.name,
-        doorbellHost: row.webhook_url === null ? null : new URL(row.webhook_url).host,
-      }));
+  /** For the approval page, after the owner's password: whether reusing `name` shares a mailbox. */
+  agentExists(name: string): boolean {
+    return this.#sql.exec("SELECT 1 FROM agents WHERE name = ?", name).toArray().length > 0;
   }
 
   /**
-   * Records an approved agent. `doorbell` replaces its webhook, `null` removes it, and
-   * `undefined` keeps whatever it has, so approving an agent again can't drop it by accident.
+   * Records an approved agent. `doorbell` replaces its webhook; `null` removes it, including the
+   * `WEBHOOK_*` doorbell; `undefined` keeps whatever it has, so approving an agent again can't
+   * drop its doorbell by accident.
    */
   saveAgent(name: string, doorbell: Doorbell | null | undefined): void {
     this.#register(name);
     if (doorbell === undefined) return;
     this.#sql.exec(
-      "UPDATE agents SET webhook_url = ?, webhook_token = ? WHERE name = ?",
+      "UPDATE agents SET webhook_url = ?, webhook_token = ?, doorbell_off = ? WHERE name = ?",
       doorbell?.url ?? null,
       doorbell?.token ?? null,
+      doorbell === null ? 1 : 0,
       name,
     );
   }
@@ -270,9 +275,51 @@ export class Board extends DurableObject {
     return [...new Set(all)].toSorted();
   }
 
-  #doorbell(name: string): Doorbell | null {
+  /** The one place that decides which doorbell, if any, an agent has. */
+  #doorbellOf(name: string, fixed: FixedAgents): Ring {
     const row = this.#sql.exec<AgentRow>("SELECT * FROM agents WHERE name = ?", name).toArray()[0];
-    return row?.webhook_url == null ? null : { url: row.webhook_url, token: row.webhook_token };
+    if (row?.webhook_url != null) return { url: row.webhook_url, token: row.webhook_token };
+    if (row?.doorbell_off === 1) return null;
+    return fixed.doorbellAgent === name ? "settings" : null;
+  }
+
+  /** What a note from `from` to `to` rings: never yourself, and not past the exchange limit. */
+  #ringFor(from: string, to: string, fixed: FixedAgents): Ring {
+    if (from === to) return null;
+    const ring = this.#doorbellOf(to, fixed);
+    return ring !== null && this.#allowExchange(from, to) ? ring : null;
+  }
+
+  /**
+   * Counts how often two agents' rings have gone back and forth. One-way notes never count, so
+   * only a reply-to-reply loop between two agents with doorbells is ever held back.
+   */
+  #allowExchange(from: string, to: string): boolean {
+    const pair = [from, to].toSorted().join("\n");
+    const now = Date.now();
+    const state = this.#exchanges.get(pair);
+    if (state === undefined || now - state.at >= EXCHANGE_WINDOW_MS) {
+      if (this.#exchanges.size > 1_000) {
+        for (const [key, stale] of this.#exchanges) {
+          if (now - stale.at >= EXCHANGE_WINDOW_MS) this.#exchanges.delete(key);
+        }
+      }
+      this.#exchanges.set(pair, { lastFrom: from, count: 0, at: now });
+      return true;
+    }
+    if (state.lastFrom !== from) state.count++;
+    state.lastFrom = from;
+    state.at = now;
+    return state.count < MAX_EXCHANGES;
+  }
+
+  /** Adds a column to an existing table; a no-op once it's there. */
+  #addColumn(table: string, column: string): void {
+    try {
+      this.#sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
+    } catch (error) {
+      if (!String(error).includes("duplicate column")) throw error;
+    }
   }
 
   /** Events for `key` in its current fixed window. */

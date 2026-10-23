@@ -2,7 +2,7 @@ import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-prov
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import { agentForToken, fixedAgentNames } from "./auth.ts";
-import type { Board, Doorbell, FixedAgents, Message } from "./board.ts";
+import type { Board, Doorbell, FixedAgents, Ring } from "./board.ts";
 import { GRANT_IDLE_DAYS, SCOPES, handleAuthorize } from "./consent.ts";
 import { ringDoorbell } from "./doorbell.ts";
 import { createServer } from "./tools.ts";
@@ -39,17 +39,24 @@ const fixedAgents = (env: Env): FixedAgents => ({
   doorbellAgent: settingsDoorbellAgent(env),
 });
 
-/** The agent's own doorbell, else the settings one if this note is for WEBHOOK_AGENT. */
-const doorbellFor = (env: Env, message: Message, own: Doorbell | null): Doorbell | null => {
-  if (own !== null) return own;
-  const agent = settingsDoorbellAgent(env);
-  if (agent === null || message.to !== agent || message.from === agent) return null;
-  return { url: env.WEBHOOK_URL ?? "", token: env.WEBHOOK_TOKEN || null };
+/** Turns the Board's decision into a webhook: the Board never sees the settings' URL or key. */
+const doorbellFor = (env: Env, ring: Ring): Doorbell | null =>
+  ring === "settings" ? { url: env.WEBHOOK_URL ?? "", token: env.WEBHOOK_TOKEN || null } : ring;
+
+let warnedAboutWebhookAgent = false;
+/** WEBHOOK_URL without WEBHOOK_AGENT rings nobody: say so once instead of failing silently. */
+const warnAboutSettings = (env: Env): void => {
+  if (warnedAboutWebhookAgent || !env.WEBHOOK_URL || env.WEBHOOK_AGENT) return;
+  warnedAboutWebhookAgent = true;
+  console.warn(
+    "WEBHOOK_URL is set but WEBHOOK_AGENT isn't, so it rings for nobody. Set WEBHOOK_AGENT to the agent it wakes, or set that agent's doorbell on the approval page.",
+  );
 };
 
 const mcp = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { agent } = GrantProps.parse(ctx.props);
+    warnAboutSettings(env);
     const board = env.BOARD.getByName("main");
     const handler = createMcpHandler(
       () =>
@@ -57,8 +64,8 @@ const mcp = {
           agent,
           board,
           fixed: fixedAgents(env),
-          onPost: (message, own) => {
-            const doorbell = doorbellFor(env, message, own);
+          onPost: (message, ring) => {
+            const doorbell = doorbellFor(env, ring);
             // waitUntil keeps the webhook call alive after the response without delaying it.
             if (doorbell !== null) ctx.waitUntil(ringDoorbell(doorbell, message));
           },

@@ -1,7 +1,7 @@
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import { AGENT_NAME } from "./auth.ts";
-import type { Board, Doorbell, FixedAgents, Message } from "./board.ts";
+import type { Board, FixedAgents, Message, Ring } from "./board.ts";
 
 export const MAX_TEXT_LENGTH = 8_000;
 export const MAX_METADATA_BYTES = 4_096;
@@ -10,7 +10,9 @@ const MAX_LIMIT = 100;
 const INSTRUCTIONS = `fridge-notes is a notes board shared by AI agents. Every note is addressed to one agent.
 - list_agents shows who you can write to.
 - post_message sends a note to an agent. It is signed with your agent name. Agents with a doorbell
-  are woken up by it. To reply to a note, send your answer to its "from".
+  are woken up by it. To reply to a note, send your answer to its "from". Don't reply to notes
+  that need no answer, like thanks or acknowledgments: agents replying to every reply would keep
+  waking each other.
 - To work through your inbox: call list_messages (your unread notes, oldest first), act on each
   note, then call mark_read with the ids you handled. Mark notes read only after acting on them,
   so nothing is lost if you stop halfway.`;
@@ -52,7 +54,7 @@ interface ServerContext {
   agent: string;
   board: DurableObjectStub<Board>;
   fixed: FixedAgents;
-  onPost: (message: Message, doorbell: Doorbell | null) => void;
+  onPost: (message: Message, ring: Ring) => void;
 }
 
 export const createServer = ({ agent, board, fixed, onPost }: ServerContext): McpServer => {
@@ -101,7 +103,7 @@ export const createServer = ({ agent, board, fixed, onPost }: ServerContext): Mc
       if ("refused" in posted) {
         return { isError: true, content: [{ type: "text", text: posted.refused }] };
       }
-      onPost(posted.message, posted.doorbell);
+      onPost(posted.message, posted.ring);
       return result(present(posted.message));
     },
   );
