@@ -53,9 +53,14 @@ const cookiesFrom = (response: Response): string =>
 /** The approval page's form fields we need to post it back. */
 const consentForm = (html: string) => ({
   handle: /name="handle" value="([^"]+)"/.exec(html)?.[1] ?? "",
-  retry: (/name="retry" value="([^"]+)"/.exec(html)?.[1] ?? "").replaceAll("&#38;", "&"),
   agent: /name="agent" value="([^"]*)"/.exec(html)?.[1] ?? "",
 });
+
+// Password lockouts are per client IP. Local dev servers take cf-connecting-ip from the request,
+// so each run uses its own made-up IPs and never locks out the next run. (Cloudflare's edge
+// overwrites the header, which is one reason this script is for local servers only.)
+const randomIp = (): string =>
+  `198.51.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}`;
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail?: unknown): void => {
@@ -248,6 +253,17 @@ try {
     await (await fetch(`${issuer}/.well-known/oauth-authorization-server`)).json(),
   );
   check("metadata names the MCP resource", resource.resource === `${baseUrl}/mcp`, resource);
+  check("issuer is the public URL", issuer === new URL(baseUrl).origin, issuer);
+
+  // The same server reached under another name must refuse, not advertise a second issuer.
+  const host = new URL(baseUrl).hostname;
+  const alias = host === "127.0.0.1" ? "localhost" : host === "localhost" ? "127.0.0.1" : undefined;
+  if (alias !== undefined) {
+    const aliasUrl = new URL(baseUrl);
+    aliasUrl.hostname = alias;
+    const misdirected = await fetch(`${aliasUrl.origin}/.well-known/oauth-authorization-server`);
+    check("other hostnames get 421", misdirected.status === 421, misdirected.status);
+  }
 
   const redirectUri = `http://127.0.0.1:${webhookPort}/callback`;
   const registered = await fetch(endpoints.registration_endpoint, {
@@ -286,25 +302,37 @@ try {
     const response = await fetch(authorizeUrl, { redirect: "manual" });
     return { response, html: await response.text(), cookie: cookiesFrom(response) };
   };
+  const ownerIp = randomIp();
   const submitConsent = (
     page: { html: string; cookie: string },
     fields: Record<string, string>,
-  ): Promise<Response> => {
-    const form = consentForm(page.html);
-    return fetch(endpoints.authorization_endpoint, {
+    ip = ownerIp,
+  ): Promise<Response> =>
+    fetch(endpoints.authorization_endpoint, {
       method: "POST",
       redirect: "manual",
-      headers: { cookie: page.cookie, "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        cookie: page.cookie,
+        "content-type": "application/x-www-form-urlencoded",
+        "cf-connecting-ip": ip,
+      },
       body: new URLSearchParams({
-        handle: form.handle,
-        retry: form.retry,
+        handle: consentForm(page.html).handle,
         scope: "notes",
         ...fields,
       }),
     });
-  };
 
   const consent = await openConsent();
+  // What a hostile site can make the owner's browser send: no handle cookie, a made-up handle.
+  const crossSite = await Promise.all(
+    Array.from({ length: 11 }, () =>
+      submitConsent(
+        { html: 'name="handle" value="forged"', cookie: "" },
+        { agent: "evil", password: "not-the-password", decision: "approve" },
+      ).then((response) => response.status),
+    ),
+  );
   if (consent.response.status === 501) {
     console.log(
       "- OAuth approval isn't available on this runtime; skipped the rest of the OAuth checks",
@@ -316,6 +344,12 @@ try {
         consent.html.includes("Smoke Test") &&
         consentForm(consent.html).agent === "smoke-test",
       consent.response.status,
+    );
+
+    check(
+      "forged approvals don't count toward the password lockout",
+      crossSite.every((status) => status === 400),
+      crossSite,
     );
 
     const wrongPassword = await submitConsent(consent, {
@@ -385,6 +419,25 @@ try {
       "refreshed token works",
       refreshed.status === 200 && afterRefresh.isError !== true,
       refreshed.status,
+    );
+
+    // 15 wrong passwords at once from one IP: exactly 10 may be checked, the rest are locked out.
+    const burstIp = randomIp();
+    const burstPages = await Promise.all(Array.from({ length: 15 }, () => openConsent()));
+    const burst = await Promise.all(
+      burstPages.map((page) =>
+        submitConsent(
+          page,
+          { agent: "guesser", password: "not-the-password", decision: "approve" },
+          burstIp,
+        ).then((response) => response.status),
+      ),
+    );
+    check(
+      "a burst of guesses can't pass the lockout",
+      burst.filter((status) => status === 400).length === 10 &&
+        burst.filter((status) => status === 429).length === 5,
+      burst,
     );
 
     const denyPage = await openConsent();
