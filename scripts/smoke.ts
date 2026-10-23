@@ -469,6 +469,17 @@ try {
       taken.status === 400 && (await taken.text()).includes("already an agent named"),
       taken.status,
     );
+    // "dormant" exists only in AUTH_TOKENS and never connects: it still counts as taken.
+    const dormant = await submitConsent(await openConsent(), {
+      agent: "dormant",
+      password: ownerPassword,
+      decision: "approve",
+    });
+    check(
+      "a name that exists only in settings counts as taken",
+      dormant.status === 400 && (await dormant.text()).includes("already an agent named"),
+      dormant.status,
+    );
 
     const wrongPassword = await submitConsent(badWebhookPage, {
       agent: "smoke-oauth",

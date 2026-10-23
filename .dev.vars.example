@@ -9,7 +9,7 @@ OWNER_PASSWORD=dev-owner-password-0000
 
 # Optional fixed tokens for clients that can't do OAuth. One `name:token` pair per agent.
 # The name becomes `from` on that agent's messages.
-AUTH_TOKENS=grok:dev-grok-token-0000,agent:dev-agent-token-0000
+AUTH_TOKENS=grok:dev-grok-token-0000,agent:dev-agent-token-0000,dormant:dev-dormant-token-0000
 
 # A doorbell from settings, for setups without the approval page (celld today): notes sent to
 # WEBHOOK_AGENT call WEBHOOK_URL with WEBHOOK_TOKEN as the bearer key. With OAuth, set doorbells
