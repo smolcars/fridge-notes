@@ -1,5 +1,8 @@
 export const AGENT_NAME = /^[\w-]{1,32}$/;
 const MIN_SECRET_LENGTH = 16;
+// RFC 6750 bearer-token characters. No colons: the OAuth library reserves `a:b:c` for its own
+// tokens and never passes that shape to the static-token lookup.
+const STATIC_TOKEN = /^[\w.~+/-]+=*$/;
 
 const sha256 = async (value: string): Promise<string> => {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -16,9 +19,14 @@ const parseTokens = async (config: string): Promise<Map<string, string>> => {
     const separator = entry.indexOf(":");
     const name = entry.slice(0, separator).trim();
     const token = entry.slice(separator + 1).trim();
-    if (separator === -1 || !AGENT_NAME.test(name) || token.length < MIN_SECRET_LENGTH) {
+    if (
+      separator === -1 ||
+      !AGENT_NAME.test(name) ||
+      token.length < MIN_SECRET_LENGTH ||
+      !STATIC_TOKEN.test(token)
+    ) {
       throw new Error(
-        `AUTH_TOKENS entry ${index + 1} must be name:token with a name of letters, digits, _ or - and a token of ${MIN_SECRET_LENGTH}+ characters`,
+        `AUTH_TOKENS entry ${index + 1} must be name:token: a name of letters, digits, _ or -, and a token of ${MIN_SECRET_LENGTH}+ letters, digits or - . _ ~ + /`,
       );
     }
     return { name, token };
