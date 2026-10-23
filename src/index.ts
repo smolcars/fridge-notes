@@ -3,7 +3,7 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import { agentForToken } from "./auth.ts";
 import type { Board } from "./board.ts";
-import { SCOPES, handleAuthorize } from "./consent.ts";
+import { GRANT_IDLE_DAYS, SCOPES, handleAuthorize } from "./consent.ts";
 import { ringDoorbell } from "./doorbell.ts";
 import { createServer } from "./tools.ts";
 
@@ -22,8 +22,6 @@ export interface Env {
 }
 
 const MAX_REQUEST_BYTES = 64 * 1024;
-/** An agent stays connected while it keeps refreshing; one idle this long must be approved again. */
-const GRANT_IDLE_SECONDS = 90 * 24 * 60 * 60;
 
 /** What every accepted token carries, OAuth or static: the agent name that becomes `from`. */
 const GrantProps = z.object({ agent: z.string() });
@@ -66,14 +64,15 @@ const providerFor = (origin: string): OAuthProvider<Env> => {
     apiRoute: "/mcp",
     apiHandler: mcp,
     defaultHandler: site,
-    authorizeEndpoint: "/authorize",
-    tokenEndpoint: "/oauth/token",
-    clientRegistrationEndpoint: "/oauth/register",
+    // Absolute URLs pin the issuer to PUBLIC_URL; relative ones follow each request's host.
+    authorizeEndpoint: `${origin}/authorize`,
+    tokenEndpoint: `${origin}/oauth/token`,
+    clientRegistrationEndpoint: `${origin}/oauth/register`,
     // Turns itself off where the runtime doesn't enforce global_fetch_strictly_public (celld).
     clientIdMetadataDocumentEnabled: true,
     scopesSupported: SCOPES,
     requiredScopes: ["notes"],
-    refreshTokenIdleTTL: GRANT_IDLE_SECONDS,
+    refreshTokenIdleTTL: GRANT_IDLE_DAYS * 24 * 60 * 60,
     resourceMetadata: { resource, authorization_servers: [origin], resource_name: "fridge-notes" },
     // AUTH_TOKENS keep working next to OAuth, for clients that can only send a fixed header.
     resolveExternalToken: async ({ token, env }) => {
@@ -102,6 +101,12 @@ export default {
         "PUBLIC_URL must be this server's public URL, e.g. https://fridge-notes.<you>.workers.dev",
       );
       return Response.json({ error: "server misconfigured" }, { status: 500 });
+    }
+    // OAuth metadata and tokens name one origin, so answer only there. /health stays open for
+    // probes that reach the server directly.
+    const url = new URL(request.url);
+    if (url.origin !== origin && url.pathname !== "/health") {
+      return Response.json({ error: `this server is ${origin}` }, { status: 421 });
     }
     return providerFor(origin).fetch(request, env, ctx);
   },
