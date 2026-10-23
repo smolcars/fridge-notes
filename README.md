@@ -177,7 +177,9 @@ beta software.
 
 **OAuth doesn't work on celld 0.6.3.** Its WebCrypto has no AES-KW, which the OAuth library uses
 to protect grants, so the approval page says OAuth is unavailable. Agents connect with
-`AUTH_TOKENS` there.
+`AUTH_TOKENS` there. Support is tracked in
+[denoland/celld#295](https://github.com/denoland/celld/issues/295); once it ships, OAuth works on
+celld with no change here.
 
 celld needs an `id` for the KV namespace (any string works), and Cloudflare needs it left out,
 so celld gets its own copy of the config. `celld.jsonc` is gitignored:
