@@ -118,14 +118,21 @@ export class Board extends DurableObject {
       .toArray().length;
   }
 
-  /** True once `client` has entered the owner password wrong too often in the current window. */
-  loginLocked(client: string): boolean {
-    return this.#count(`login:${client}`, LOGIN_WINDOW_MS) >= LOGIN_FAILURES;
+  /**
+   * Counts an owner-password attempt before the password is checked, in one step, so a burst of
+   * concurrent guesses can't all pass the check first. False once `client` is locked out.
+   */
+  beginLoginAttempt(client: string): boolean {
+    const key = `login:${client}`;
+    if (this.#count(key, LOGIN_WINDOW_MS) >= LOGIN_FAILURES) return false;
+    this.#hit(key, LOGIN_WINDOW_MS);
+    return true;
   }
 
-  /** Only failures count, so the owner never locks themselves out by approving apps. */
-  recordLoginFailure(client: string): void {
-    this.#hit(`login:${client}`, LOGIN_WINDOW_MS);
+  /** A correct password gives its attempt back, so approving apps never locks the owner out. */
+  forgiveLoginAttempt(client: string): void {
+    const window = this.#windows.get(`login:${client}`);
+    if (window !== undefined && window.count > 0) window.count--;
   }
 
   /** Events for `key` in its current fixed window. */

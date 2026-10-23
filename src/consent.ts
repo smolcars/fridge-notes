@@ -10,6 +10,8 @@ import type { Env } from "./index.ts";
 
 /** Everything this server can grant. `notes` is the only real permission: full board access. */
 export const SCOPES = ["notes", "offline_access"];
+/** An approved agent stays connected until it goes this long without using fridge-notes. */
+export const GRANT_IDLE_DAYS = 90;
 
 const PAGE_HEADERS: Record<string, string> = {
   "content-type": "text/html; charset=utf-8",
@@ -73,8 +75,6 @@ const suggestAgentName = (clientName: string): string =>
 
 interface FormState {
   handle: string;
-  /** The original /authorize URL, so a wrong password can show a fresh form. */
-  retry: string;
   agent: string;
   error?: string | undefined;
 }
@@ -92,11 +92,14 @@ const consentPage = (details: ConsentDescription, form: FormState): string => {
     `Connect ${details.clientName}`,
     `<h1>Connect ${name} to fridge-notes?</h1>
 <p class="muted">${origin} Access will be sent to <strong>${escape(details.redirectHost)}</strong>.</p>
+<p>It will be able to read every note on the board, post notes (which wake Grok Bot), and mark
+notes read. It stays connected until it goes ${GRANT_IDLE_DAYS} days without using fridge-notes.</p>
 ${details.redirectIsLoopback ? '<p class="warn">This sends access to an app on a computer, not a website. Continue only if you just started connecting from it.</p>' : ""}
 ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
 <form method="post">
+  <!-- The form's first submit button is what Enter presses. Disabled, so Enter can't approve. -->
+  <button type="submit" disabled hidden aria-hidden="true" tabindex="-1"></button>
   <input type="hidden" name="handle" value="${escape(form.handle)}">
-  <input type="hidden" name="retry" value="${escape(form.retry)}">
   ${scopes}
   <label>Agent name
     <small>Shown as "from" on its messages. Name Grok Bot "grok".</small>
@@ -113,21 +116,27 @@ ${form.error === undefined ? "" : `<p class="error">${escape(form.error)}</p>`}
   );
 };
 
+/**
+ * Renders the form for `authRequest` with a fresh single-use handle. `carry` holds headers a
+ * previous step must still send, such as the cookie update from a used-up handle.
+ */
 const showConsent = async (
   oauth: OAuthHelpers,
   authRequest: AuthRequest,
-  form: Omit<FormState, "handle" | "agent"> & { agent?: string },
+  form: { agent?: string; error?: string },
   status = 200,
+  carry?: Headers,
 ): Promise<Response> => {
   const details = await oauth.describeConsent(authRequest);
   const consent = await oauth.beginConsent(authRequest);
+  for (const cookie of carry?.getSetCookie() ?? []) consent.headers.append("set-cookie", cookie);
   for (const [name, value] of Object.entries(PAGE_HEADERS)) {
     if (!consent.headers.has(name)) consent.headers.set(name, value);
   }
   const state = {
-    ...form,
     handle: consent.handle,
     agent: form.agent ?? suggestAgentName(details.clientName),
+    error: form.error,
   };
   return new Response(consentPage(details, state), { status, headers: consent.headers });
 };
@@ -148,38 +157,34 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   if (!ownerPasswordConfigured(env.OWNER_PASSWORD)) {
     return notice(500, "Not set up yet", "Set OWNER_PASSWORD (16+ characters) to approve apps.");
   }
+
+  // First, check that this form came from a page this browser opened, and use its handle up. A
+  // cross-site POST fails here, before it can count against the owner's password attempts.
+  const requested = form
+    .getAll("scope")
+    .filter((s): s is string => typeof s === "string" && SCOPES.includes(s));
+  const approved = await oauth.approveConsent(request, handle, {
+    scope: [...new Set(["notes", ...requested])],
+  });
+  const agent = field("agent").trim();
+  const retry = (error: string) =>
+    showConsent(oauth, approved.request, { agent, error }, 400, approved.headers);
+  if (!AGENT_NAME.test(agent)) return retry("Agent name: use 1 to 32 letters, digits, _ or -.");
+
   const board = env.BOARD.getByName("main");
   const client = request.headers.get("cf-connecting-ip") ?? "unknown";
-  if (await board.loginLocked(client)) {
+  if (!(await board.beginLoginAttempt(client))) {
     return notice(
       429,
       "Too many wrong passwords",
       "Wait 15 minutes, then connect again from your app.",
     );
   }
-
-  const agent = field("agent").trim();
-  let problem: string | undefined;
-  if (!AGENT_NAME.test(agent)) {
-    problem = "Agent name: use 1 to 32 letters, digits, _ or -.";
-  } else if (!(await passwordMatches(field("password"), env.OWNER_PASSWORD))) {
-    await board.recordLoginFailure(client);
-    problem = "Wrong password.";
+  if (!(await passwordMatches(field("password"), env.OWNER_PASSWORD))) {
+    return retry("Wrong password.");
   }
-  if (problem !== undefined) {
-    const retry = field("retry");
-    if (!retry.startsWith("/authorize?")) {
-      return notice(400, "Can't continue", "Start again from your app.");
-    }
-    const authRequest = await oauth.parseAuthRequest(new Request(new URL(retry, request.url)));
-    return showConsent(oauth, authRequest, { retry, agent, error: problem }, 400);
-  }
+  await board.forgiveLoginAttempt(client);
 
-  const requested = form
-    .getAll("scope")
-    .filter((s): s is string => typeof s === "string" && SCOPES.includes(s));
-  const scope = [...new Set(["notes", ...requested])];
-  const approved = await oauth.approveConsent(request, handle, { scope });
   const { redirectTo } = await oauth.completeAuthorization({
     request: approved.request,
     userId: "owner",
@@ -205,9 +210,8 @@ export const handleAuthorize = async (request: Request, env: Env): Promise<Respo
   }
   try {
     if (request.method === "GET") {
-      const { pathname, search } = new URL(request.url);
       const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      return await showConsent(env.OAUTH_PROVIDER, authRequest, { retry: pathname + search });
+      return await showConsent(env.OAUTH_PROVIDER, authRequest, {});
     }
     if (request.method === "POST") return await submitConsent(request, env);
     return notice(405, "Not allowed", "Use GET or POST.");
