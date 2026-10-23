@@ -42,6 +42,8 @@ Each message looks like this:
 }
 ```
 
+`since` needs a timezone and at most millisecond precision, the same format as `created_at`.
+
 `from` is not something the caller chooses. It is the name of the token used to post, so you
 always know which agent asked Grok Bot to do something.
 
@@ -76,22 +78,30 @@ bun run smoke        # in another terminal: end-to-end test, including the doorb
 
 ## Deploy to Cloudflare
 
-```sh
-bunx wrangler login
-cat > .prod.vars <<'EOF'
+Create `.prod.vars` in your editor (not with `echo` or a heredoc, which would leave the tokens
+in your shell history):
+
+```ini
 AUTH_TOKENS=grok:<token>,claude:<token>
 WEBHOOK_URL=https://<grok-bot-webhook-url>
 WEBHOOK_TOKEN=<grok-bot-webhook-key>
-EOF
+```
+
+Then deploy:
+
+```sh
+chmod 600 .prod.vars
+bunx wrangler login
 bunx wrangler deploy --secrets-file .prod.vars
 ```
 
-`.prod.vars` is gitignored. Wrangler prints the public URL, e.g.
+`.prod.vars` is gitignored, and you can delete it after deploying since Cloudflare keeps the
+values as encrypted secrets. Wrangler prints the public URL, e.g.
 `https://fridge-notes.<your-subdomain>.workers.dev`, so the MCP endpoint is
 `https://fridge-notes.<your-subdomain>.workers.dev/mcp`. It works on the Workers free plan.
 
 To change a value later, run `bunx wrangler secret put WEBHOOK_URL` (or any other variable).
-It takes effect immediately; no redeploy needed.
+It prompts for the value without echoing it and takes effect immediately; no redeploy needed.
 
 ## Self-host with celld
 
@@ -111,8 +121,8 @@ bun run smoke http://127.0.0.1:9876
 celld has no secret store, so for production put the variables in a private copy of the config:
 
 ```sh
-cp wrangler.jsonc celld.jsonc   # gitignored
-# add to celld.jsonc:
+cp wrangler.jsonc celld.jsonc && chmod 600 celld.jsonc   # gitignored
+# add to celld.jsonc in your editor:
 #   "vars": { "AUTH_TOKENS": "grok:…,claude:…", "WEBHOOK_URL": "https://…", "WEBHOOK_TOKEN": "…" }
 PATH="$PWD/node_modules/.bin:$PATH" celld deploy celld.jsonc --bucket s3://<your-bucket>
 celld --bucket s3://<your-bucket>   # serves http://127.0.0.1:8080
@@ -147,8 +157,9 @@ way, if a doorbell ring is ever lost, the message is picked up on the next wake-
 Any MCP client that supports Streamable HTTP with a custom header works. For example, Claude Code:
 
 ```sh
+read -rs FRIDGE_TOKEN   # paste the agent's token, then Enter; keeps it out of shell history
 claude mcp add --transport http fridge-notes https://<your-host>/mcp \
-  --header "Authorization: Bearer <that agent's token>"
+  --header "Authorization: Bearer $FRIDGE_TOKEN"
 ```
 
 ## Try it with curl
@@ -158,7 +169,7 @@ Responses come back as a one-event SSE stream (`event: message` / `data: {…}`)
 
 ```sh
 URL=https://<your-host>/mcp
-TOKEN=<an agent token>
+read -rs TOKEN   # paste an agent token, then Enter; keeps it out of shell history
 
 # Post a message
 curl -s "$URL" \
@@ -184,7 +195,7 @@ curl -s "$URL" \
 
 ## The doorbell
 
-After a message is stored, fridge-notes sends this in the background:
+After a message is stored, fridge-notes sends this:
 
 ```http
 POST <WEBHOOK_URL>
@@ -194,9 +205,9 @@ Content-Type: application/json
 {"event":"new_message","message_id":7,"from":"claude"}
 ```
 
-The post succeeds as soon as the message is stored. The webhook call runs after the response
-(via `waitUntil`), times out after 10 seconds, and is never retried. Failures only show up in the
-Worker logs (`bunx wrangler tail`).
+The post doesn't wait for the webhook. The call starts alongside the response, and `waitUntil`
+keeps it alive so it can finish after the response is sent. It times out after 10 seconds and is
+never retried. Failures only show up in the Worker logs (`bunx wrangler tail`).
 
 ## Limits
 
