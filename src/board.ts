@@ -1,15 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 
-export type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
-export type Metadata = { [key: string]: Json };
-
+/** A stored message. `metadata` stays a JSON string so the type survives the RPC boundary. */
 export interface Message {
   id: number;
   text: string;
   from: string;
   created_at: string;
   read: boolean;
-  metadata: Metadata | null;
+  metadata: string | null;
 }
 
 export interface ListOptions {
@@ -36,8 +34,7 @@ const toMessage = (row: MessageRow): Message => ({
   from: row.sender,
   created_at: row.created_at,
   read: row.read === 1,
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- only post() writes this column, from validated Metadata
-  metadata: row.metadata === null ? null : (JSON.parse(row.metadata) as Metadata),
+  metadata: row.metadata,
 });
 
 /** The single message board. One instance, addressed by name, holds every message in SQLite. */
@@ -62,7 +59,8 @@ export class Board extends DurableObject {
     this.#sql.exec("CREATE INDEX IF NOT EXISTS messages_by_read ON messages (read, id)");
   }
 
-  post(from: string, text: string, metadata?: Metadata): Message {
+  /** `metadata` is a JSON object serialized by the caller. */
+  post(from: string, text: string, metadata: string | undefined): Message {
     this.#checkRateLimit(from);
     const row = this.#sql
       .exec<MessageRow>(
@@ -70,7 +68,7 @@ export class Board extends DurableObject {
         text,
         from,
         new Date().toISOString(),
-        metadata === undefined ? null : JSON.stringify(metadata),
+        metadata ?? null,
       )
       .one();
     return toMessage(row);
