@@ -1,3 +1,6 @@
+import type { FixedAgents } from "./board.ts";
+import type { Env } from "./index.ts";
+
 export const AGENT_NAME = /^[\w-]{1,32}$/;
 const MIN_SECRET_LENGTH = 16;
 // RFC 6750 bearer-token characters. No colons: the OAuth library reserves `a:b:c` for its own
@@ -66,6 +69,18 @@ export const fixedAgentNames = (config: string | undefined): string[] =>
     const parsed = parseEntry(entry);
     return parsed === null ? [] : [parsed.name];
   });
+
+/**
+ * Agents that exist through settings: `AUTH_TOKENS` names, and `WEBHOOK_AGENT` when `WEBHOOK_URL`
+ * is set. Every check of who exists uses this, so a settings-only agent is never overlooked.
+ */
+export const fixedAgents = (env: Env): FixedAgents => {
+  const doorbellAgent = env.WEBHOOK_AGENT?.trim() ?? "";
+  return {
+    names: fixedAgentNames(env.AUTH_TOKENS),
+    doorbellAgent: env.WEBHOOK_URL && AGENT_NAME.test(doorbellAgent) ? doorbellAgent : null,
+  };
+};
 
 /** True if `OWNER_PASSWORD` is set and long enough to resist guessing. */
 export const ownerPasswordConfigured = (expected: string | undefined): expected is string =>

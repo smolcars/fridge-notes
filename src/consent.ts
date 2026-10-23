@@ -5,7 +5,7 @@ import {
   type ConsentDescription,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
-import { AGENT_NAME, ownerPasswordConfigured, passwordMatches } from "./auth.ts";
+import { AGENT_NAME, fixedAgents, ownerPasswordConfigured, passwordMatches } from "./auth.ts";
 import type { Doorbell } from "./board.ts";
 import { isLoopbackHost, parseDoorbell } from "./doorbell.ts";
 import type { Env } from "./index.ts";
@@ -240,7 +240,7 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
 
   // Only now, with the owner's password checked, may the page reveal that a name is taken. Taking
   // over an existing agent's notes has to be deliberate.
-  if (!reuse && (await board.agentExists(agent))) {
+  if (!reuse && (await board.agentExists(agent, fixedAgents(env)))) {
     return retry(
       `There's already an agent named "${agent}". To give this app its notes, tick "I'm reconnecting" and approve again; otherwise pick another name.`,
     );

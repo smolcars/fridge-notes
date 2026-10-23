@@ -1,8 +1,8 @@
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import * as z from "zod";
-import { agentForToken, fixedAgentNames } from "./auth.ts";
-import type { Board, Doorbell, FixedAgents, Ring } from "./board.ts";
+import { agentForToken, fixedAgents } from "./auth.ts";
+import type { Board, Doorbell, Ring } from "./board.ts";
 import { GRANT_IDLE_DAYS, SCOPES, handleAuthorize } from "./consent.ts";
 import { ringDoorbell } from "./doorbell.ts";
 import { createServer } from "./tools.ts";
@@ -30,14 +30,6 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 
 /** What every accepted token carries, OAuth or static: the agent name that becomes `from`. */
 const GrantProps = z.object({ agent: z.string() });
-
-const settingsDoorbellAgent = (env: Env): string | null =>
-  env.WEBHOOK_AGENT && env.WEBHOOK_URL ? env.WEBHOOK_AGENT.trim() : null;
-
-const fixedAgents = (env: Env): FixedAgents => ({
-  names: fixedAgentNames(env.AUTH_TOKENS),
-  doorbellAgent: settingsDoorbellAgent(env),
-});
 
 /** Turns the Board's decision into a webhook: the Board never sees the settings' URL or key. */
 const doorbellFor = (env: Env, ring: Ring): Doorbell | null =>
