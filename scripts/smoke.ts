@@ -1,5 +1,5 @@
-// End-to-end check of a running server: static-token and OAuth auth, every MCP tool, limits,
-// and the webhook doorbell.
+// End-to-end check of a running server: static-token and OAuth auth, every MCP tool, mailbox
+// isolation between agents, limits, and doorbells.
 // Defaults match .dev.vars.example, so locally it is just `bun run dev`, then `bun run smoke`.
 //
 //   bun scripts/smoke.ts [base-url]   (default http://127.0.0.1:8787)
@@ -24,11 +24,18 @@ const Message = z.object({
   id: z.number(),
   text: z.string(),
   from: z.string(),
+  to: z.string().nullable(),
   created_at: z.string(),
   read: z.boolean(),
   metadata: z.record(z.string(), z.unknown()).nullable(),
 });
-const Ring = z.object({ event: z.string(), message_id: z.number(), from: z.string() });
+const Agents = z.array(z.object({ name: z.string(), has_doorbell: z.boolean() }));
+const Ring = z.object({
+  event: z.string(),
+  message_id: z.number(),
+  from: z.string(),
+  to: z.string(),
+});
 const ProtectedResource = z.object({
   resource: z.string(),
   authorization_servers: z.array(z.string()).min(1),
@@ -54,6 +61,7 @@ const cookiesFrom = (response: Response): string =>
 const consentForm = (html: string) => ({
   handle: /name="handle" value="([^"]+)"/.exec(html)?.[1] ?? "",
   agent: /name="agent" value="([^"]*)"/.exec(html)?.[1] ?? "",
+  webhookUrl: /name="webhook_url" type="url" value="([^"]*)"/.exec(html)?.[1] ?? "",
 });
 
 // Password lockouts are per client IP. Local dev servers take cf-connecting-ip from the request,
@@ -119,14 +127,16 @@ const tool = async <T extends z.ZodType>(
   return schema.parse(parseJson(text));
 };
 
-// Webhook receiver standing in for Grok Bot's doorbell.
-const rings: { authorization: string | null; body: z.infer<typeof Ring> }[] = [];
+// Webhook receiver standing in for the agents' doorbells: /webhook is the one from settings
+// (WEBHOOK_AGENT=grok), /oauth-bell the one set on the approval page.
+const rings: { path: string; authorization: string | null; body: z.infer<typeof Ring> }[] = [];
 let onRing = (): void => {};
 const receiver = Bun.serve({
   hostname: "127.0.0.1",
   port: webhookPort,
   async fetch(request) {
     rings.push({
+      path: new URL(request.url).pathname,
       authorization: request.headers.get("authorization"),
       body: Ring.parse(await request.json()),
     });
@@ -170,70 +180,128 @@ try {
     .safeParse(listed.result);
   const names = (tools.data?.tools ?? []).map((t) => t.name).toSorted();
   check(
-    "tools/list has the four tools",
-    names.join() === "list_messages,list_recent,mark_read,post_message",
+    "tools/list has the five tools",
+    names.join() === "list_agents,list_messages,list_recent,mark_read,post_message",
     names,
+  );
+
+  // Addressing and doorbells.
+  const missingTo = await callTool(agentToken, "post_message", { text: "hi" });
+  check("notes need a recipient", missingTo.isError === true, missingTo);
+  const unknown = await callTool(agentToken, "post_message", { to: "nobody-here", text: "hi" });
+  check(
+    "notes to unknown agents are refused",
+    unknown.isError === true && (unknown.content[0]?.text ?? "").includes("no agent named"),
+    unknown,
   );
 
   const rang = nextRing(5_000);
   const posted = await tool(Message, agentToken, "post_message", {
+    to: "grok",
     text: "milk is out",
     metadata: { shelf: 2 },
   });
-  check("post_message signs with the token's agent", posted.from === "agent", posted);
+  check(
+    "post_message signs with your agent and addresses the note",
+    posted.from === "agent" && posted.to === "grok",
+    posted,
+  );
   check("post_message keeps metadata", posted.metadata?.["shelf"] === 2, posted);
-  check("doorbell rings", await rang, rings);
+  check("a note to an agent with a doorbell rings it", await rang, rings);
   const ring = rings.at(-1);
   check(
-    "doorbell sends the webhook bearer",
-    ring?.authorization === `Bearer ${webhookToken}`,
+    "the doorbell sends the webhook's bearer key",
+    ring?.path === "/webhook" && ring.authorization === `Bearer ${webhookToken}`,
     ring,
   );
   check(
-    "doorbell body names the message",
-    ring?.body.event === "new_message" && ring.body.message_id === posted.id,
+    "the doorbell names the note and its recipient",
+    ring?.body.event === "new_message" &&
+      ring.body.message_id === posted.id &&
+      ring.body.to === "grok",
     ring?.body,
   );
 
-  const silent = nextRing(1_500);
-  const fromGrok = await tool(Message, grokToken, "post_message", { text: "noted" });
-  check("grok's own post does not ring", !(await silent), rings);
+  const quietReply = nextRing(1_500);
+  const reply = await tool(Message, grokToken, "post_message", { to: "agent", text: "noted" });
+  check("a reply to an agent without a doorbell doesn't ring", !(await quietReply), rings);
+  const quietSelf = nextRing(1_500);
+  const selfNote = await tool(Message, grokToken, "post_message", { to: "grok", text: "todo" });
+  check("a note to yourself doesn't ring", !(await quietSelf), rings);
 
-  const inbox = { after_id: posted.id - 1 };
-  const unread = await tool(z.array(Message), grokToken, "list_messages", inbox);
+  // Mailboxes: every agent sees and marks only the notes addressed to it.
+  const sinceFirst = { after_id: posted.id - 1 };
+  const grokInbox = await tool(z.array(Message), grokToken, "list_messages", sinceFirst);
   check(
-    "list_messages returns unread, oldest first",
-    unread[0]?.id === posted.id && unread[1]?.id === fromGrok.id,
-    unread,
+    "list_messages returns your unread notes, oldest first",
+    grokInbox.map((m) => m.id).join() === `${posted.id},${selfNote.id}`,
+    grokInbox,
+  );
+  const agentInbox = await tool(z.array(Message), agentToken, "list_messages", sinceFirst);
+  check(
+    "agents don't see each other's notes",
+    agentInbox.map((m) => m.id).join() === `${reply.id}`,
+    agentInbox,
   );
   const since = await tool(z.array(Message), grokToken, "list_messages", {
-    since: fromGrok.created_at,
+    since: selfNote.created_at,
     unread_only: false,
   });
   check(
     "list_messages filters by timestamp",
-    since.length > 0 && since.every((message) => message.id >= fromGrok.id),
+    since.length > 0 && since.every((m) => m.id >= selfNote.id && m.to === "grok"),
     since,
   );
 
   const Marked = z.object({ marked: z.number() });
-  const marked = await tool(Marked, grokToken, "mark_read", { ids: [posted.id, fromGrok.id] });
-  check("mark_read marks both", marked.marked === 2, marked);
+  const stolen = await tool(Marked, agentToken, "mark_read", { ids: [posted.id, selfNote.id] });
+  check("agents can't mark each other's notes read", stolen.marked === 0, stolen);
+  const marked = await tool(Marked, grokToken, "mark_read", {
+    ids: [posted.id, selfNote.id, reply.id],
+  });
+  check("mark_read marks only your own notes", marked.marked === 2, marked);
   const again = await tool(Marked, grokToken, "mark_read", { ids: [posted.id] });
   check("mark_read is idempotent", again.marked === 0, again);
-  const after = await tool(z.array(Message), grokToken, "list_messages", inbox);
-  check("read messages leave the inbox", after.length === 0, after);
+  const grokAfter = await tool(z.array(Message), grokToken, "list_messages", sinceFirst);
+  check("read notes leave your inbox", grokAfter.length === 0, grokAfter);
+  const agentAfter = await tool(z.array(Message), agentToken, "list_messages", sinceFirst);
+  check(
+    "another agent's mark_read leaves your notes unread",
+    agentAfter.map((m) => m.id).join() === `${reply.id}`,
+    agentAfter,
+  );
 
   const recent = await tool(z.array(Message), agentToken, "list_recent", { limit: 2 });
   check(
-    "list_recent is newest first",
-    recent[0]?.id === fromGrok.id && recent[1]?.id === posted.id,
+    "list_recent shows notes to or from you, newest first",
+    recent[0]?.id === reply.id && recent[1]?.id === posted.id,
     recent,
   );
+  const agentRecent = await tool(z.array(Message), agentToken, "list_recent", { limit: 100 });
+  check(
+    "list_recent hides other agents' notes",
+    agentRecent.every((m) => m.from === "agent" || m.to === "agent"),
+    agentRecent.filter((m) => m.from !== "agent" && m.to !== "agent"),
+  );
 
-  const tooLong = await callTool(agentToken, "post_message", { text: "x".repeat(8_001) });
+  const agentsResult = await callTool(agentToken, "list_agents", {});
+  const agentsText = agentsResult.content[0]?.text ?? "[]";
+  const agents = Agents.parse(parseJson(agentsText));
+  check(
+    "list_agents shows who has a doorbell",
+    agents.find((a) => a.name === "grok")?.has_doorbell === true &&
+      agents.find((a) => a.name === "agent")?.has_doorbell === false,
+    agents,
+  );
+  check("list_agents never shows webhooks", !agentsText.includes("http"), agentsText);
+
+  const tooLong = await callTool(agentToken, "post_message", {
+    to: "grok",
+    text: "x".repeat(8_001),
+  });
   check("oversized text is rejected", tooLong.isError === true, tooLong);
   const bigMetadata = await callTool(agentToken, "post_message", {
+    to: "grok",
     text: "hi",
     metadata: { blob: "x".repeat(5_000) },
   });
@@ -345,6 +413,11 @@ try {
         consentForm(consent.html).agent === "smoke-test",
       consent.response.status,
     );
+    check(
+      "approval page lists the existing agents",
+      consent.html.includes("Existing agents") && consent.html.includes("<strong>grok</strong>"),
+      consent.html.length,
+    );
 
     check(
       "forged approvals don't count toward the password lockout",
@@ -352,23 +425,43 @@ try {
       crossSite,
     );
 
-    const wrongPassword = await submitConsent(consent, {
+    const oauthBell = `http://127.0.0.1:${webhookPort}/oauth-bell`;
+    const badWebhook = await submitConsent(consent, {
+      agent: "smoke-oauth",
+      password: ownerPassword,
+      webhook_url: "http://example.com/hook",
+      decision: "approve",
+    });
+    const badWebhookPage = { html: await badWebhook.text(), cookie: cookiesFrom(badWebhook) };
+    check(
+      "a webhook that isn't https is refused",
+      badWebhook.status === 400 && badWebhookPage.html.includes("must start with https://"),
+      badWebhook.status,
+    );
+
+    const wrongPassword = await submitConsent(badWebhookPage, {
       agent: "smoke-oauth",
       password: "not-the-password",
+      webhook_url: oauthBell,
+      webhook_key: "oauth-bell-key",
       decision: "approve",
     });
     const retryPage = { html: await wrongPassword.text(), cookie: cookiesFrom(wrongPassword) };
     check(
-      "wrong password shows the form again",
+      "wrong password shows the form again, keeping the name and webhook but not the key",
       wrongPassword.status === 400 &&
         retryPage.html.includes("Wrong password") &&
-        consentForm(retryPage.html).agent === "smoke-oauth",
+        consentForm(retryPage.html).agent === "smoke-oauth" &&
+        consentForm(retryPage.html).webhookUrl === oauthBell &&
+        !retryPage.html.includes("oauth-bell-key"),
       wrongPassword.status,
     );
 
     const approved = await submitConsent(retryPage, {
       agent: "smoke-oauth",
       password: ownerPassword,
+      webhook_url: oauthBell,
+      webhook_key: "oauth-bell-key",
       decision: "approve",
     });
     const callback = new URL(approved.headers.get("location") ?? "about:blank");
@@ -398,7 +491,10 @@ try {
     check("code exchanges for tokens", exchange.status === 200 && tokens.success, exchange.status);
     const accessToken = tokens.data?.access_token ?? "";
 
-    const viaOAuth = await tool(Message, accessToken, "post_message", { text: "hello over OAuth" });
+    const viaOAuth = await tool(Message, accessToken, "post_message", {
+      to: "agent",
+      text: "hello over OAuth",
+    });
     check("OAuth token posts as the approved agent", viaOAuth.from === "smoke-oauth", viaOAuth);
 
     const refreshed = await fetch(endpoints.token_endpoint, {
@@ -419,6 +515,43 @@ try {
       "refreshed token works",
       refreshed.status === 200 && afterRefresh.isError !== true,
       refreshed.status,
+    );
+
+    /** Posts a note from `agent` to smoke-oauth and reports whether its doorbell rang. */
+    const ringsSmokeOauth = async (): Promise<boolean> => {
+      const rung = nextRing(2_000);
+      await tool(Message, agentToken, "post_message", { to: "smoke-oauth", text: "ping" });
+      return (await rung) && rings.at(-1)?.path === "/oauth-bell";
+    };
+    check("a doorbell set on the approval page rings", await ringsSmokeOauth(), rings.at(-1));
+    check(
+      "it sends the key from the approval page",
+      rings.at(-1)?.authorization === "Bearer oauth-bell-key",
+      rings.at(-1),
+    );
+
+    /** Approves the same app again with `fields`. This replaces its approval, and the tokens above. */
+    const reapprove = async (fields: Record<string, string>): Promise<number> => {
+      const page = await openConsent();
+      const response = await submitConsent(page, {
+        agent: "smoke-oauth",
+        password: ownerPassword,
+        decision: "approve",
+        ...fields,
+      });
+      return response.status;
+    };
+    const keptStatus = await reapprove({});
+    check(
+      "approving again without a webhook keeps the doorbell",
+      keptStatus === 302 && (await ringsSmokeOauth()),
+      keptStatus,
+    );
+    const removedStatus = await reapprove({ webhook_remove: "1" });
+    check(
+      "the remove box takes the doorbell away",
+      removedStatus === 302 && !(await ringsSmokeOauth()),
+      removedStatus,
     );
 
     // 15 wrong passwords at once from one IP: exactly 10 may be checked, the rest are locked out.

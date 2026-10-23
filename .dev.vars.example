@@ -9,10 +9,11 @@ OWNER_PASSWORD=dev-owner-password-0000
 
 # Optional fixed tokens for clients that can't do OAuth. One `name:token` pair per agent.
 # The name becomes `from` on that agent's messages.
-# The agent named `grok` is Grok Bot: its own posts never ring the doorbell.
 AUTH_TOKENS=grok:dev-grok-token-0000,agent:dev-agent-token-0000
 
-# Grok Bot's inbound webhook (the doorbell) and the bearer key it expects. Leave WEBHOOK_URL
-# empty to disable the doorbell.
+# A doorbell from settings, for setups without the approval page (celld today): notes sent to
+# WEBHOOK_AGENT call WEBHOOK_URL with WEBHOOK_TOKEN as the bearer key. With OAuth, set doorbells
+# on the approval page instead and leave these out.
+WEBHOOK_AGENT=grok
 WEBHOOK_URL=http://127.0.0.1:8788/webhook
 WEBHOOK_TOKEN=dev-webhook-token
