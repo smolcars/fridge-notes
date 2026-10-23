@@ -12,7 +12,8 @@
     "bindings": [{ "name": "BOARD", "class_name": "Board" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Board"] }],
-  // OAuth clients, grants and tokens. No id: `wrangler deploy` creates the namespace. celld needs
-  // an id, which goes in its private celld.jsonc (see the README).
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  // OAuth clients, grants and tokens. The id is this deployment's namespace, which wrangler created
+  // and wrote here. Deploying your own copy? Delete the id and wrangler creates yours. celld takes
+  // any string as the id.
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "5239f2a8c2ae4e03a2478f3ae394b305" }],
 }
