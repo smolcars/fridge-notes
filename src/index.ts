@@ -1,8 +1,8 @@
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import * as z from "zod";
-import { agentForToken } from "./auth.ts";
-import type { Board } from "./board.ts";
+import { agentForToken, fixedAgentNames } from "./auth.ts";
+import type { Board, Doorbell, FixedAgents, Message } from "./board.ts";
 import { GRANT_IDLE_DAYS, SCOPES, handleAuthorize } from "./consent.ts";
 import { ringDoorbell } from "./doorbell.ts";
 import { createServer } from "./tools.ts";
@@ -17,6 +17,11 @@ export interface Env {
   PUBLIC_URL?: string;
   OWNER_PASSWORD?: string;
   AUTH_TOKENS?: string;
+  /**
+   * A doorbell from settings, for setups without the approval page (celld, until it can run
+   * OAuth): notes to WEBHOOK_AGENT ring WEBHOOK_URL. A doorbell set on the approval page wins.
+   */
+  WEBHOOK_AGENT?: string;
   WEBHOOK_URL?: string;
   WEBHOOK_TOKEN?: string;
 }
@@ -25,6 +30,22 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 
 /** What every accepted token carries, OAuth or static: the agent name that becomes `from`. */
 const GrantProps = z.object({ agent: z.string() });
+
+const settingsDoorbellAgent = (env: Env): string | null =>
+  env.WEBHOOK_AGENT && env.WEBHOOK_URL ? env.WEBHOOK_AGENT.trim() : null;
+
+const fixedAgents = (env: Env): FixedAgents => ({
+  names: fixedAgentNames(env.AUTH_TOKENS),
+  doorbellAgent: settingsDoorbellAgent(env),
+});
+
+/** The agent's own doorbell, else the settings one if this note is for WEBHOOK_AGENT. */
+const doorbellFor = (env: Env, message: Message, own: Doorbell | null): Doorbell | null => {
+  if (own !== null) return own;
+  const agent = settingsDoorbellAgent(env);
+  if (agent === null || message.to !== agent || message.from === agent) return null;
+  return { url: env.WEBHOOK_URL ?? "", token: env.WEBHOOK_TOKEN || null };
+};
 
 const mcp = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -35,8 +56,12 @@ const mcp = {
         createServer({
           agent,
           board,
-          // waitUntil keeps the webhook call alive after the response without delaying it.
-          onPost: (message) => ctx.waitUntil(ringDoorbell(env, message)),
+          fixed: fixedAgents(env),
+          onPost: (message, own) => {
+            const doorbell = doorbellFor(env, message, own);
+            // waitUntil keeps the webhook call alive after the response without delaying it.
+            if (doorbell !== null) ctx.waitUntil(ringDoorbell(doorbell, message));
+          },
         }),
       { maxRequestBodySize: MAX_REQUEST_BYTES },
     );

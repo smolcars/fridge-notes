@@ -49,6 +49,16 @@ export const agentForToken = async (
   return tokens.get(await sha256(token));
 };
 
+/**
+ * The agent names in `AUTH_TOKENS`, so notes can be addressed to them before they first connect.
+ * Skips malformed entries instead of throwing: a typo there must not stop OAuth agents posting.
+ */
+export const fixedAgentNames = (config: string | undefined): string[] =>
+  (config ?? "")
+    .split(",")
+    .map((entry) => entry.slice(0, entry.indexOf(":")).trim())
+    .filter((name) => AGENT_NAME.test(name));
+
 /** True if `OWNER_PASSWORD` is set and long enough to resist guessing. */
 export const ownerPasswordConfigured = (expected: string | undefined): expected is string =>
   expected !== undefined && expected.length >= MIN_SECRET_LENGTH;
