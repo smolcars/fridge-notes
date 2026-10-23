@@ -5,6 +5,7 @@ worker-configuration.d.ts
 
 # Local secrets
 .dev.vars
+.prod.vars
 .env
 .env.local
 celld.jsonc
