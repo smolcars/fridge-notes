@@ -5,8 +5,14 @@
   "name": "fridge-notes",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
+  // Blocks OAuth client-metadata fetches from reaching private addresses (SSRF). The OAuth library
+  // only accepts metadata-URL clients where the runtime enforces it.
+  "compatibility_flags": ["global_fetch_strictly_public"],
   "durable_objects": {
     "bindings": [{ "name": "BOARD", "class_name": "Board" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Board"] }],
+  // OAuth clients, grants and tokens. No id: `wrangler deploy` creates the namespace. celld needs
+  // an id, which goes in its private celld.jsonc (see the README).
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
 }

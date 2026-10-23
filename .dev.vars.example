@@ -1,7 +1,14 @@
 # Copy to .dev.vars for `bun run dev` / `celld dev`. These values match the smoke test defaults.
 # Never use them in production: generate real tokens with `openssl rand -hex 32`.
 
-# One `name:token` pair per agent. The name becomes `from` on that agent's messages.
+# This server's public URL. OAuth clients and tokens are bound to it.
+PUBLIC_URL=http://127.0.0.1:8787
+
+# Typed on the approval page when an app connects over OAuth. 16+ characters.
+OWNER_PASSWORD=dev-owner-password-0000
+
+# Optional fixed tokens for clients that can't do OAuth. One `name:token` pair per agent.
+# The name becomes `from` on that agent's messages.
 # The agent named `grok` is Grok Bot: its own posts never ring the doorbell.
 AUTH_TOKENS=grok:dev-grok-token-0000,agent:dev-agent-token-0000
 
