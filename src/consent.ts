@@ -173,7 +173,8 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
 
   const board = env.BOARD.getByName("main");
   const client = request.headers.get("cf-connecting-ip") ?? "unknown";
-  if (!(await board.beginLoginAttempt(client))) {
+  const attempt = await board.beginLoginAttempt(client);
+  if (attempt === undefined) {
     return notice(
       429,
       "Too many wrong passwords",
@@ -183,7 +184,7 @@ const submitConsent = async (request: Request, env: Env): Promise<Response> => {
   if (!(await passwordMatches(field("password"), env.OWNER_PASSWORD))) {
     return retry("Wrong password.");
   }
-  await board.forgiveLoginAttempt(client);
+  await board.forgiveLoginAttempt(client, attempt);
 
   const { redirectTo } = await oauth.completeAuthorization({
     request: approved.request,

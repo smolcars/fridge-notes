@@ -64,7 +64,7 @@ export class Board extends DurableObject {
 
   /** `metadata` is a JSON object serialized by the caller. */
   post(from: string, text: string, metadata: string | undefined): Message {
-    if (this.#hit(`post:${from}`, 60_000) > POSTS_PER_MINUTE) {
+    if (this.#hit(`post:${from}`, 60_000).count > POSTS_PER_MINUTE) {
       throw new Error(`Rate limit exceeded: at most ${POSTS_PER_MINUTE} posts per minute`);
     }
     const row = this.#sql
@@ -120,19 +120,22 @@ export class Board extends DurableObject {
 
   /**
    * Counts an owner-password attempt before the password is checked, in one step, so a burst of
-   * concurrent guesses can't all pass the check first. False once `client` is locked out.
+   * concurrent guesses can't all pass the check first. Returns the window the attempt counted in,
+   * for `forgiveLoginAttempt`, or undefined once `client` is locked out.
    */
-  beginLoginAttempt(client: string): boolean {
+  beginLoginAttempt(client: string): number | undefined {
     const key = `login:${client}`;
-    if (this.#count(key, LOGIN_WINDOW_MS) >= LOGIN_FAILURES) return false;
-    this.#hit(key, LOGIN_WINDOW_MS);
-    return true;
+    if (this.#count(key, LOGIN_WINDOW_MS) >= LOGIN_FAILURES) return undefined;
+    return this.#hit(key, LOGIN_WINDOW_MS).start;
   }
 
-  /** A correct password gives its attempt back, so approving apps never locks the owner out. */
-  forgiveLoginAttempt(client: string): void {
+  /**
+   * A correct password gives its attempt back, so approving apps never locks the owner out. Only
+   * to the window it was counted in: a late refund must not erase a failure in a newer window.
+   */
+  forgiveLoginAttempt(client: string, windowStart: number): void {
     const window = this.#windows.get(`login:${client}`);
-    if (window !== undefined && window.count > 0) window.count--;
+    if (window?.start === windowStart && window.count > 0) window.count--;
   }
 
   /** Events for `key` in its current fixed window. */
@@ -141,8 +144,8 @@ export class Board extends DurableObject {
     return window === undefined || Date.now() - window.start >= windowMs ? 0 : window.count;
   }
 
-  /** Records an event for `key` and returns the count in its current fixed window. */
-  #hit(key: string, windowMs: number): number {
+  /** Records an event for `key` and returns its current fixed window. */
+  #hit(key: string, windowMs: number): { start: number; count: number } {
     const now = Date.now();
     if (this.#windows.size > 1_000) {
       // Login keys are per client IP, so drop finished windows before the map can grow unbounded.
@@ -152,9 +155,11 @@ export class Board extends DurableObject {
     }
     const window = this.#windows.get(key);
     if (window === undefined || now - window.start >= windowMs) {
-      this.#windows.set(key, { start: now, count: 1 });
-      return 1;
+      const fresh = { start: now, count: 1 };
+      this.#windows.set(key, fresh);
+      return fresh;
     }
-    return ++window.count;
+    window.count++;
+    return window;
   }
 }
