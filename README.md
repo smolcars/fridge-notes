@@ -43,17 +43,20 @@ bun install
 
    ```ini
    PUBLIC_URL=https://fridge-notes.<your-subdomain>.workers.dev
-   OWNER_PASSWORD=<16+ characters, kept in your password manager>
+   OWNER_PASSWORD='<16+ characters, kept in your password manager>'
    WEBHOOK_URL=<Grok Bot's webhook URL>
    WEBHOOK_TOKEN=<Grok Bot's webhook key>
    ```
 
-   `OWNER_PASSWORD` is what you type to approve an agent. `WEBHOOK_URL` and `WEBHOOK_TOKEN`
-   come from Grok Bot; add them later if you don't have them yet.
+   `OWNER_PASSWORD` is what you type to approve an agent. Keep the single quotes: without them,
+   a `#` in the password starts a comment and cuts the password short. (A password with a `'` in
+   it won't work; pick another.) `WEBHOOK_URL` and `WEBHOOK_TOKEN` come from Grok Bot; add them
+   later if you don't have them yet.
 
 2. If you're deploying your own copy, delete the `"id"` from the `kv_namespaces` line in
-   `wrangler.jsonc`. The one there belongs to the original deployment. Wrangler creates your own
-   storage on the first deploy and writes its id back; commit that so later deploys keep using it.
+   `wrangler.jsonc`; it belongs to the original deployment. Wrangler creates your own storage on
+   the first deploy and writes its id into the file. Running a second copy in the same Cloudflare
+   account? Also change `name` in `wrangler.jsonc`, and use that copy's URL as `PUBLIC_URL`.
 
 3. Deploy. On a remote machine, where the browser login can't reach back, use
    `bunx wrangler login --device` instead of `bunx wrangler login`.
@@ -64,15 +67,19 @@ bun install
    bunx wrangler deploy --secrets-file .prod.vars
    ```
 
-4. Check that wrangler printed the same URL you put in `PUBLIC_URL`, then open
-   `<that URL>/health`. It should say `{"ok":true}`. A new `workers.dev` subdomain can take a
-   minute or two to start answering.
+4. Check that wrangler printed the same URL you put in `PUBLIC_URL`. If not, fix it with
+   `bunx wrangler secret put PUBLIC_URL`. Then open `<that URL>/health`; it should say
+   `{"ok":true}`. A new `workers.dev` subdomain can take a minute or two to start answering.
 
 Your MCP URL is `PUBLIC_URL` + `/mcp`. Next, [connect Grok Bot](#connect-grok-bot).
 
-To change a setting later, run `bunx wrangler secret put <NAME>`; to remove one, run
-`bunx wrangler secret delete <NAME>`. Both take effect immediately. Removing a line from
-`.prod.vars` and deploying again does **not** remove that setting.
+Cloudflare keeps the settings, so deploy later code changes with plain `bunx wrangler deploy`.
+To change a setting, run `bunx wrangler secret put <NAME>`; to remove one, run
+`bunx wrangler secret delete <NAME>`. Both take effect immediately.
+
+Delete `.prod.vars` after the first deploy, or keep it in sync with every change. Deploying again
+with `--secrets-file` and an old file puts the old values back, such as a password you replaced.
+Removing a line from the file doesn't remove that setting.
 
 ### Option 2: Self-hosted with celld
 
@@ -108,8 +115,9 @@ that the OAuth library needs. Until
    celld --bucket s3://<your-bucket> --trust-forwarded-headers
    ```
 
-4. Put a TLS proxy in front, since celld serves plain HTTP on port 8080. Caddy works out of the
-   box:
+4. Put a TLS proxy in front, since celld serves plain HTTP on port 8080. With Caddy, point your
+   domain's DNS at the server and open ports 80 and 443, and Caddy gets the certificate itself
+   ([details](https://caddyserver.com/docs/quick-starts/reverse-proxy)):
 
    ```sh
    caddy reverse-proxy --from notes.example.com --to 127.0.0.1:8080
@@ -135,6 +143,9 @@ starts an empty one.
    > You have new notes on fridge-notes. Call `list_messages` to get your unread notes, oldest
    > first, and handle each one. After you've acted on a note, call `mark_read` with its id. If
    > you got as many notes as the limit, call `list_messages` again until you get fewer.
+
+On celld, where OAuth isn't available yet, give the connector a [fixed token](#fixed-tokens)
+named `grok` instead, and skip step 2.
 
 Grok Bot reads everything unread on each wake-up, so a missed doorbell is caught next time.
 
@@ -165,9 +176,9 @@ The approval page asks for an agent name. It shows up as `from` on that agent's 
   url = "https://<your-host>/mcp"
   ```
 
-  Then run `codex mcp login fridge-notes` and approve. If Codex runs on a remote machine, your
-  browser lands on a `localhost` page that fails to load; copy that page's URL and run
-  `curl '<that URL>'` on the remote machine within a few minutes.
+  Then run `codex mcp login fridge-notes` and approve. If Codex runs on a remote machine, add
+  `--no-browser` and finish the same way as Claude Code: open the link it prints, approve, and
+  paste the failed `localhost` page's URL back in.
 
 Each approval lasts until the agent goes 90 days without using fridge-notes. There's no button
 yet to disconnect a single agent; deleting everything in the `OAUTH_KV` namespace disconnects all
@@ -208,7 +219,10 @@ On Cloudflare, `bunx wrangler secret put AUTH_TOKENS` changes the tokens and
 | `mark_read`     | Marks notes read by `ids` (up to 100). Returns how many were unread.                                                                                               |
 | `list_recent`   | Lists the latest notes, newest first, read or not. For debugging. `limit` defaults to 20.                                                                          |
 
-Every agent can use every tool. A note looks like this:
+Every agent can use every tool. Read status is shared: once any agent marks a note read, it's
+gone from everyone's unread list, Grok Bot's included.
+
+A note looks like this:
 
 ```json
 {
@@ -238,13 +252,13 @@ retried. Failures show up in the logs (`bunx wrangler tail`).
 
 ## Settings
 
-| Setting          | Required  | What it is                                                                          |
-| ---------------- | --------- | ----------------------------------------------------------------------------------- |
-| `PUBLIC_URL`     | yes       | The server's address. Requests to any other hostname are refused, except `/health`. |
-| `OWNER_PASSWORD` | for OAuth | Typed on the approval page. At least 16 characters.                                 |
-| `AUTH_TOKENS`    | no        | [Fixed tokens](#fixed-tokens). Tokens: 16+ letters, digits or `- . _ ~ + /`.        |
-| `WEBHOOK_URL`    | no        | Grok Bot's webhook. Leave it empty to turn the doorbell off.                        |
-| `WEBHOOK_TOKEN`  | no        | Sent to the webhook as `Authorization: Bearer <WEBHOOK_TOKEN>`.                     |
+| Setting          | Required  | What it is                                                                                                                                                                                                       |
+| ---------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUBLIC_URL`     | yes       | The server's public address: scheme, host and port, e.g. `https://notes.example.com`. Requests arriving under any other address get `421`; `/health` answers anyway, so it can't tell you `PUBLIC_URL` is wrong. |
+| `OWNER_PASSWORD` | for OAuth | Typed on the approval page. At least 16 characters.                                                                                                                                                              |
+| `AUTH_TOKENS`    | no        | [Fixed tokens](#fixed-tokens). Tokens: 16+ letters, digits or `- . _ ~ + /`.                                                                                                                                     |
+| `WEBHOOK_URL`    | no        | Grok Bot's webhook. Leave it empty to turn the doorbell off.                                                                                                                                                     |
+| `WEBHOOK_TOKEN`  | no        | Sent to the webhook as `Authorization: Bearer <WEBHOOK_TOKEN>`.                                                                                                                                                  |
 
 If you change `PUBLIC_URL` (say, to a custom domain), agents connected with OAuth must be
 approved again.
